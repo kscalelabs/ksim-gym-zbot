@@ -45,23 +45,23 @@ def get_servo_deadband() -> tuple[float, float]:
 ZEROS: list[tuple[str, float]] = [
     ("right_hip_yaw", 0.0),
     ("right_hip_roll", 0.0),
-    ("right_hip_pitch", 0.0),
-    ("right_knee_pitch", 0.0),
-    ("right_ankle_pitch", 0.0),
+    ("right_hip_pitch", -0.4),
+    ("right_knee_pitch", -0.8),
+    ("right_ankle_pitch", -0.4),
     ("right_ankle_roll", 0.0),
     ("left_hip_yaw", 0.0),
     ("left_hip_roll", 0.0),
-    ("left_hip_pitch", 0.0),
-    ("left_knee_pitch", 0.0),
-    ("left_ankle_pitch", 0.0),
+    ("left_hip_pitch", -0.4),
+    ("left_knee_pitch", -0.8),
+    ("left_ankle_pitch", -0.4),
     ("left_ankle_roll", 0.0),
     ("left_shoulder_pitch", 0.0),
-    ("left_shoulder_roll", 0.0),
-    ("left_elbow_roll", 0.0),
+    ("left_shoulder_roll", 0.2),
+    ("left_elbow_roll", 0.2),
     ("left_gripper_roll", 0.0),
     ("right_shoulder_pitch", 0.0),
-    ("right_shoulder_roll", 0.0),
-    ("right_elbow_roll", 0.0),
+    ("right_shoulder_roll", -0.2),
+    ("right_elbow_roll", -0.2),
     ("right_gripper_roll", 0.0),
 ]
 
@@ -385,6 +385,21 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+@attrs.define(frozen=True, kw_only=True)
+class SimpleSingleFootContactReward(ksim.Reward):
+    """Reward having one and only one foot in contact with the ground, while walking."""
+
+    scale: float = 1.0
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
+        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
+        single = jnp.logical_xor(left_contact, right_contact).squeeze()
+
+        is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
+        reward = jnp.where(is_zero_cmd, 1.0, single)
+        return reward
+
 
 def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
     """Rotates one quaternion by another quaternion through quaternion multiplication.
@@ -594,8 +609,7 @@ class Actor(eqx.Module):
         # Softplus and clip to ensure positive standard deviations.
         std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
 
-        # Comment out because we now sample deltas not absolute positions
-        # mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
+        mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
 
         dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
 
@@ -1090,7 +1104,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
-            # ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
+            ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.0),
             # ksim.RandomJointVelocityReset(),
             # ksim.RandomHeadingReset(),
         ]
@@ -1128,6 +1142,12 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 noise=math.radians(0),
             ),
         ]
+        # get_observations
+        obs_list += [
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch",  noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=0.0),
+        ]
+
 
         # Add action-position observation for each joint
         obs_list.extend(
@@ -1170,6 +1190,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             XYOrientationReward(scale=0.2,          error_scale=0.03),
             BaseHeightReward(scale=0.1,             error_scale=0.05,
                             standard_height=0.28),          # adjust if COM is lower
+
+            SimpleSingleFootContactReward(scale=0.3),
 
             # keep the old posture prior (optional)
             JointPositionPenalty.create_from_names(
