@@ -509,6 +509,13 @@ class ImuOrientationObservation(ksim.StatefulObservation):
 
         return x, (x, lag)
 
+@attrs.define(frozen=True)
+class BaseHeightObservation(ksim.Observation):
+    """Single-scalar z of body-1 (the robot base)."""
+    def observe(self, state: ksim.ObservationInput, curriculum_level, rng):
+        # body 0 is world; body 1 is the floating base
+        return state.physics_state.data.xpos[1, 2:]
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
@@ -1096,6 +1103,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             FeetechTorqueObservation(),
             ksim.CenterOfMassInertiaObservation(),
             ksim.CenterOfMassVelocityObservation(),
+            BaseHeightObservation(),
             ksim.BasePositionObservation(),
             ksim.BaseOrientationObservation(),
             ksim.BaseLinearVelocityObservation(),
