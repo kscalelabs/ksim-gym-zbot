@@ -261,6 +261,110 @@ class UnifiedCommand(ksim.Command):
 
 
 @attrs.define(frozen=True, kw_only=True)
+class LinearVelocityTrackingReward(ksim.Reward):
+    """Reward for tracking the linear velocity."""
+
+    error_scale: float = attrs.field(default=0.25)
+    linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
+    command_name: str = attrs.field(default="unified_command")
+    norm: xax.NormType = attrs.field(default="l2")
+    stand_still_threshold: float = attrs.field(default=1e-2)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # need to get lin vel obs from sensor, because xvel is not available in Trajectory.
+        if self.linvel_obs_name not in trajectory.obs:
+            raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
+
+        # Get global frame velocities
+        global_vel = trajectory.obs[self.linvel_obs_name]
+
+        # get base quat, only yaw.
+        # careful to only rotate in z, disregard rx and ry, bad conflict with roll and pitch.
+        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler = base_euler.at[:, :2].set(0.0)
+        base_z_quat = xax.euler_to_quat(base_euler)
+
+        # rotate local frame commands to global frame
+        robot_vel_cmd = jnp.zeros_like(global_vel).at[:, :2].set(trajectory.command[self.command_name][:, :2])
+        global_vel_cmd = xax.rotate_vector_by_quat(robot_vel_cmd, base_z_quat, inverse=False)
+
+        # drop vz. vz conflicts with base height reward.
+        global_vel_xy_cmd = global_vel_cmd[:, :2]
+        global_vel_xy = global_vel[:, :2]
+
+        # now compute error. special trick: different kernels for standing and walking.
+        zero_cmd_mask = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < self.stand_still_threshold
+        vel_error = jnp.linalg.norm(global_vel_xy - global_vel_xy_cmd, axis=-1)
+        error = jnp.where(zero_cmd_mask, vel_error, 2 * jnp.square(vel_error))
+        return jnp.exp(-error / self.error_scale)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class AngularVelocityTrackingReward(ksim.Reward):
+    """Reward for tracking the heading using quaternion-based error computation."""
+
+    error_scale: float = attrs.field(default=0.25)
+    command_name: str = attrs.field(default="unified_command")
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        base_yaw = xax.quat_to_euler(trajectory.xquat[:, 1, :])[:, 2]
+        base_yaw_cmd = trajectory.command[self.command_name][:, 3]
+
+        base_yaw_quat = xax.euler_to_quat(
+            jnp.stack([jnp.zeros_like(base_yaw_cmd), jnp.zeros_like(base_yaw_cmd), base_yaw], axis=-1)
+        )
+        base_yaw_target_quat = xax.euler_to_quat(
+            jnp.stack([jnp.zeros_like(base_yaw_cmd), jnp.zeros_like(base_yaw_cmd), base_yaw_cmd], axis=-1)
+        )
+
+        # Compute quaternion error
+        quat_error = 1 - jnp.sum(base_yaw_target_quat * base_yaw_quat, axis=-1) ** 2
+        return jnp.exp(-quat_error / self.error_scale)
+
+
+@attrs.define(frozen=True)
+class XYOrientationReward(ksim.Reward):
+    """Reward for tracking the xy base orientation using quaternion-based error computation."""
+
+    error_scale: float = attrs.field(default=0.25)
+    command_name: str = attrs.field(default="unified_command")
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        euler_orientation = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        euler_orientation = euler_orientation.at[:, 2].set(0.0)  # ignore yaw
+        base_xy_quat = xax.euler_to_quat(euler_orientation)
+
+        commanded_euler = jnp.stack(
+            [
+                trajectory.command[self.command_name][:, 5],
+                trajectory.command[self.command_name][:, 6],
+                jnp.zeros_like(trajectory.command[self.command_name][:, 6]),
+            ],
+            axis=-1,
+        )
+        base_xy_quat_cmd = xax.euler_to_quat(commanded_euler)
+
+        quat_error = 1 - jnp.sum(base_xy_quat_cmd * base_xy_quat, axis=-1) ** 2
+        return jnp.exp(-quat_error / self.error_scale)
+
+
+@attrs.define(frozen=True)
+class BaseHeightReward(ksim.Reward):
+    """Reward for keeping the base height at the commanded height."""
+
+    error_scale: float = attrs.field(default=0.25)
+    standard_height: float = attrs.field(default=0.29)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        current_height = trajectory.xpos[:, 1, 2]  # 1st body, because world is 0. 2nd element is z.
+        commanded_height = trajectory.command["unified_command"][:, 4] + self.standard_height
+
+        height_error = jnp.abs(current_height - commanded_height)
+        # is_zero_cmd = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < 1e-3
+        # height_error = jnp.where(is_zero_cmd, height_error, height_error**2)  # smooth kernel for walking.
+        return jnp.exp(-height_error / self.error_scale)
+
+@attrs.define(frozen=True, kw_only=True)
 class JointPositionPenalty(ksim.JointDeviationPenalty):
     @classmethod
     def create_from_names(
@@ -1047,19 +1151,19 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ),
         ]
 
-    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
+    def get_rewards(self, physics_model):
         return [
             ksim.StayAliveReward(scale=1.0),
-            ksim.UprightReward(scale=1.0),
-            # ksim.AngularVelocityPenalty(index=("x", "y", "z"), scale=-0.005,scale_by_curriculum=True),
-            # ksim.LinearVelocityPenalty(index=("x", "y", "z"), scale=-0.005,scale_by_curriculum=True),
-            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            # ksim.ReachabilityPenalty(
-            #     delta_max_j=tuple(float(x) for x in self.delta_max_j),
-            #     scale=-1.0,
-            #     squared=True,
-            #     scale_by_curriculum=True,
-            # ),
+            # ksim.UprightReward(scale=1.0),
+
+            # --- command-tracking ---
+            LinearVelocityTrackingReward(scale=0.8,  error_scale=0.2),
+            AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
+            XYOrientationReward(scale=0.2,          error_scale=0.03),
+            BaseHeightReward(scale=0.1,             error_scale=0.05,
+                            standard_height=0.29),          # adjust if COM is lower
+
+            # keep the old posture prior (optional)
             JointPositionPenalty.create_from_names(
                 physics_model=physics_model,
                 names=[name for name, _ in ZEROS],
