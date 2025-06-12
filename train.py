@@ -25,8 +25,9 @@ from ksim.utils.mujoco import get_ctrl_data_idx_by_name
 logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 20
-NUM_ACTOR_INPUTS = 43
-NUM_CRITIC_INPUTS = 476
+NUM_COMMANDS = 7
+NUM_ACTOR_INPUTS = 43 + NUM_COMMANDS      # 50
+NUM_CRITIC_INPUTS = 476 + NUM_COMMANDS     # 483
 
 
 def get_servo_deadband() -> tuple[float, float]:
@@ -785,6 +786,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
+        cmd_7       = commands["joystick_command"]          # shape (...,7)
 
         def maybe_drop(x: Array, p: float, key: PRNGKeyArray) -> Array:
             mask = jax.random.bernoulli(key, p, x.shape)
@@ -800,6 +802,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 joint_pos_n,  # NUM_JOINTS
                 joint_vel_n,  # NUM_JOINTS
                 proj_grav_3,  # 3
+                cmd_7,        # 7
             ],
             axis=-1,
         )
@@ -822,6 +825,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         proj_grav_3 = observations["projected_gravity_observation"]
+        cmd_7       = commands["joystick_command"]
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
@@ -835,6 +839,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
                 proj_grav_3,  # 3
+                cmd_7,  # 7
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
@@ -946,6 +951,6 @@ if __name__ == "__main__":
             save_every_n_seconds=60,
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
-            valid_first_n_steps=1,
+            # valid_first_n_steps=1,
         ),
     )
