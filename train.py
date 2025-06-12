@@ -353,7 +353,7 @@ class BaseHeightReward(ksim.Reward):
     """Reward for keeping the base height at the commanded height."""
 
     error_scale: float = attrs.field(default=0.25)
-    standard_height: float = attrs.field(default=0.29)
+    standard_height: float = attrs.field(default=0.28)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         current_height = trajectory.xpos[:, 1, 2]  # 1st body, because world is 0. 2nd element is z.
@@ -1145,15 +1145,15 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
         return [
             UnifiedCommand(
-                vx_range=(-0.75, 2.0),  # m/s
-                vy_range=(-0.5, 0.5),  # m/s
+                vx_range=(-0.1, 0.3),  # m/s
+                vy_range=(-0.075, 0.075),  # m/s
                 wz_range=(-0.5, 0.5),  # rad/s
                 # bh_range=(-0.05, 0.05), # m
                 bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
-                bh_standing_range=(-0.2, 0.0), # m
+                bh_standing_range=(0.0, 0.0), # m
                 # bh_standing_range=(0.0, 0.0),  # m
-                rx_range=(-0.5, 0.5),  # rad
-                ry_range=(-0.5, 0.5),  # rad
+                rx_range=(-0.0, 0.0),  # rad
+                ry_range=(-0.0, 0.0),  # rad
                 ctrl_dt=self.config.ctrl_dt,
                 switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
             ),
@@ -1169,7 +1169,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             XYOrientationReward(scale=0.2,          error_scale=0.03),
             BaseHeightReward(scale=0.1,             error_scale=0.05,
-                            standard_height=0.29),          # adjust if COM is lower
+                            standard_height=0.28),          # adjust if COM is lower
 
             # keep the old posture prior (optional)
             JointPositionPenalty.create_from_names(
