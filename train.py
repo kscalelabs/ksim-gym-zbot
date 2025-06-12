@@ -25,9 +25,10 @@ from ksim.utils.mujoco import get_ctrl_data_idx_by_name
 logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 20
-NUM_COMMANDS = 7
-NUM_ACTOR_INPUTS = 43 + NUM_COMMANDS      # 50
-NUM_CRITIC_INPUTS = 476 + NUM_COMMANDS     # 483
+NUM_COMMANDS = 6
+NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS           # 50
+# Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
+NUM_CRITIC_INPUTS = 484   # 340
 
 
 def get_servo_deadband() -> tuple[float, float]:
@@ -72,6 +73,192 @@ class PlannerState:
     velocity: Array
     last_computed_torque: Array
 
+@attrs.define(kw_only=True)
+class UnifiedLinearVelocityCommandMarker(ksim.vis.Marker):
+    """Visualise the planar (x,y) velocity command from unified command."""
+
+    command_name: str = attrs.field()
+    size: float = attrs.field(default=0.03)
+    arrow_scale: float = attrs.field(default=0.1)
+    height: float = attrs.field(default=0.5)
+    base_length: float = attrs.field(default=0.25)
+
+    def update(self, trajectory: ksim.Trajectory) -> None:
+        cmd = trajectory.command[self.command_name]
+        vx, vy = float(cmd[0]), float(cmd[1])
+        speed = (vx * vx + vy * vy) ** 0.5
+        self.pos = (0.0, 0.0, self.height)
+
+        # Always show arrow with base length plus scaling
+        self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+        arrow_length = self.base_length + self.arrow_scale * speed
+        self.scale = (self.size, self.size, arrow_length)
+
+        if speed < 1e-4:  # zero command → point forward, grey color
+            self.orientation = self.quat_from_direction((1.0, 0.0, 0.0))
+            self.rgba = (0.8, 0.8, 0.8, 0.8)
+        else:  # non-zero command → point in command direction, green color
+            self.orientation = self.quat_from_direction((vx, vy, 0.0))
+            self.rgba = (0.2, 0.8, 0.2, 0.8)
+
+    @classmethod
+    def get(
+        cls,
+        command_name: str,
+        *,
+        arrow_scale: float = 0.1,
+        height: float = 0.5,
+        base_length: float = 0.25,
+    ) -> Self:
+        return cls(
+            command_name=command_name,
+            target_type="root",
+            geom=mujoco.mjtGeom.mjGEOM_ARROW,
+            scale=(0.03, 0.03, base_length),
+            arrow_scale=arrow_scale,
+            height=height,
+            base_length=base_length,
+            track_rotation=True,
+        )
+
+
+@attrs.define(kw_only=True)
+class UnifiedAbsoluteYawCommandMarker(ksim.vis.Marker):
+    """Visualise the absolute yaw command from unified command."""
+
+    command_name: str = attrs.field()
+    size: float = attrs.field(default=0.02)
+    height: float = attrs.field(default=0.7)
+    arrow_scale: float = attrs.field(default=0.1)
+    base_length: float = attrs.field(default=0.25)
+
+    def update(self, trajectory: ksim.Trajectory) -> None:
+        cmd = trajectory.command[self.command_name]
+        yaw = float(cmd[3])  # yaw command is in position 3
+        self.pos = (0.0, 0.0, self.height)
+
+        # Always show arrow with base length plus scaling
+        self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+        arrow_length = self.base_length + self.arrow_scale * abs(yaw)
+        self.scale = (self.size, self.size, arrow_length)
+
+        if abs(yaw) < 1e-4:  # zero command → point forward, grey color
+            self.orientation = self.quat_from_direction((1.0, 0.0, 0.0))
+            self.rgba = (0.8, 0.8, 0.8, 0.8)
+        else:  # non-zero command → point in yaw direction, blue color
+            # Convert yaw to direction vector (rotate around z-axis)
+            direction_x = jnp.cos(yaw)
+            direction_y = jnp.sin(yaw)
+            self.orientation = self.quat_from_direction((float(direction_x), float(direction_y), 0.0))
+            self.rgba = (0.2, 0.2, 0.8, 0.8)
+
+    @classmethod
+    def get(
+        cls,
+        command_name: str,
+        *,
+        arrow_scale: float = 0.1,
+        height: float = 0.7,
+        base_length: float = 0.25,
+    ) -> Self:
+        return cls(
+            command_name=command_name,
+            target_type="root",
+            geom=mujoco.mjtGeom.mjGEOM_ARROW,
+            scale=(0.02, 0.02, base_length),
+            arrow_scale=arrow_scale,
+            height=height,
+            base_length=base_length,
+            track_rotation=False,
+        )
+
+
+@attrs.define(frozen=True)
+class UnifiedCommand(ksim.Command):
+    """Unifiying all commands into one to allow for covariance control."""
+
+    vx_range: tuple[float, float] = attrs.field()
+    vy_range: tuple[float, float] = attrs.field()
+    wz_range: tuple[float, float] = attrs.field()
+    bh_range: tuple[float, float] = attrs.field()
+    bh_standing_range: tuple[float, float] = attrs.field()
+    rx_range: tuple[float, float] = attrs.field()
+    ry_range: tuple[float, float] = attrs.field()
+    ctrl_dt: float = attrs.field()
+    switch_prob: float = attrs.field()
+
+    def initial_command(self, physics_data: ksim.PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
+        rng_a, rng_b, rng_c, rng_d, rng_e, rng_f, rng_g, rng_h = jax.random.split(rng, 8)
+
+        # cmd  = [vx, vy, wz, bh, rx, ry]
+        vx = jax.random.uniform(rng_b, (1,), minval=self.vx_range[0], maxval=self.vx_range[1])
+        vy = jax.random.uniform(rng_c, (1,), minval=self.vy_range[0], maxval=self.vy_range[1])
+        wz = jax.random.uniform(rng_d, (1,), minval=self.wz_range[0], maxval=self.wz_range[1])
+        bh = jax.random.uniform(rng_e, (1,), minval=self.bh_range[0], maxval=self.bh_range[1])
+        bhs = jax.random.uniform(rng_f, (1,), minval=self.bh_standing_range[0], maxval=self.bh_standing_range[1])
+        rx = jax.random.uniform(rng_g, (1,), minval=self.rx_range[0], maxval=self.rx_range[1])
+        ry = jax.random.uniform(rng_h, (1,), minval=self.ry_range[0], maxval=self.ry_range[1])
+
+        # don't like super small velocity commands
+        vx = jnp.where(jnp.abs(vx) < 0.09, 0.0, vx)
+        vy = jnp.where(jnp.abs(vy) < 0.09, 0.0, vy)
+        wz = jnp.where(jnp.abs(wz) < 0.09, 0.0, wz)
+
+        _ = jnp.zeros_like(vx)
+
+        # Create each mode's command vector
+        forward_cmd = jnp.concatenate([vx, _, _, bh, _, _])
+        sideways_cmd = jnp.concatenate([_, vy, _, bh, _, _])
+        rotate_cmd = jnp.concatenate([_, _, wz, bh, _, _])
+        omni_cmd = jnp.concatenate([vx, vy, wz, bh, _, _])
+        stand_cmd = jnp.concatenate([_, _, _, bhs, rx, ry])
+
+        # randomly select a mode
+        mode = jax.random.randint(rng_a, (), minval=0, maxval=6) # 0 1 2 3 4s 5s -- 2/6 standing
+        cmd = jnp.where(mode == 0, forward_cmd,
+              jnp.where(mode == 1, sideways_cmd,
+              jnp.where(mode == 2, rotate_cmd,
+              jnp.where(mode == 3, omni_cmd,
+              stand_cmd))))
+
+        # get initial heading
+        init_euler = xax.quat_to_euler(physics_data.xquat[1])
+        init_heading = init_euler[2] + self.ctrl_dt * cmd[2]  # add 1 step of yaw vel cmd to initial heading.
+        cmd = jnp.concatenate([cmd[:3], jnp.array([init_heading]), cmd[3:]])
+        assert cmd.shape == (7,)
+
+        return cmd
+
+    def __call__(
+        self, prev_command: Array, physics_data: ksim.PhysicsData, curriculum_level: Array, rng: PRNGKeyArray
+    ) -> Array:
+        def update_heading(prev_command: Array) -> Array:
+            """Update the heading by integrating the angular velocity."""
+            wz_cmd, heading = prev_command[2], prev_command[3]
+            heading = heading + wz_cmd * self.ctrl_dt
+            prev_command = prev_command.at[3].set(heading)
+            return prev_command
+
+        continued_command = update_heading(prev_command)
+
+        rng_a, rng_b = jax.random.split(rng)
+        switch_mask = jax.random.bernoulli(rng_a, self.switch_prob)
+        new_command = self.initial_command(physics_data, curriculum_level, rng_b)
+        return jnp.where(switch_mask, new_command, continued_command)
+
+    def get_markers(self) -> list[ksim.vis.Marker]:
+        """Return markers for visualizing the unified command components."""
+        return [
+            UnifiedAbsoluteYawCommandMarker.get(
+                command_name=self.command_name,
+                height=0.7,
+            ),
+            UnifiedLinearVelocityCommandMarker.get(
+                command_name=self.command_name,
+                height=0.5,
+            ),
+        ]
+
 
 @attrs.define(frozen=True, kw_only=True)
 class JointPositionPenalty(ksim.JointDeviationPenalty):
@@ -94,6 +281,129 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+
+def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
+    """Rotates one quaternion by another quaternion through quaternion multiplication.
+
+    This performs the operation: rotating_quat * quat_to_rotate * rotating_quat^(-1) if inverse=False
+    or rotating_quat^(-1) * quat_to_rotate * rotating_quat if inverse=True
+
+    Args:
+        quat_to_rotate: The quaternion being rotated (w,x,y,z), shape (*, 4)
+        rotating_quat: The quaternion performing the rotation (w,x,y,z), shape (*, 4)
+        inverse: If True, rotate by the inverse of rotating_quat
+        eps: Small epsilon value to avoid division by zero in normalization
+
+    Returns:
+        The rotated quaternion (w,x,y,z), shape (*, 4)
+    """
+    # Normalize both quaternions
+    quat_to_rotate = quat_to_rotate / (jnp.linalg.norm(quat_to_rotate, axis=-1, keepdims=True) + eps)
+    rotating_quat = rotating_quat / (jnp.linalg.norm(rotating_quat, axis=-1, keepdims=True) + eps)
+
+    # If inverse requested, conjugate the rotating quaternion (negate x,y,z components)
+    if inverse:
+        rotating_quat = rotating_quat.at[..., 1:].multiply(-1)
+
+    # Extract components of both quaternions
+    w1, x1, y1, z1 = jnp.split(rotating_quat, 4, axis=-1)  # rotating quaternion
+    w2, x2, y2, z2 = jnp.split(quat_to_rotate, 4, axis=-1)  # quaternion being rotated
+
+    # Quaternion multiplication formula
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    result = jnp.concatenate([w, x, y, z], axis=-1)
+
+    # Normalize result
+    return result / (jnp.linalg.norm(result, axis=-1, keepdims=True) + eps)
+
+@attrs.define(frozen=True, kw_only=True)
+class ImuOrientationObservation(ksim.StatefulObservation):
+    """Observes the IMU orientation, back spun in yaw heading, as commanded.
+
+    This provides an approximation of reading the IMU orientation from
+    the IMU on the physical robot, backspun by commanded heading. The `framequat_name` should be the name of
+    the framequat sensor attached to the IMU.
+
+    Example: if yaw cmd = 3.14, and IMU reading is [0, 0, 0, 1], then back spun IMU heading obs is [1, 0, 0, 0]
+
+    The policy learns to keep the IMU heading obs around [1, 0, 0, 0].
+    """
+
+    framequat_idx_range: tuple[int, int | None] = attrs.field()
+    lag_range: tuple[float, float] = attrs.field(
+        default=(0.01, 0.1),
+        validator=attrs.validators.deep_iterable(
+            attrs.validators.and_(
+                attrs.validators.ge(0.0),
+                attrs.validators.lt(1.0),
+            ),
+        ),
+    )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        physics_model: ksim.PhysicsModel,
+        framequat_name: str,
+        lag_range: tuple[float, float] = (0.01, 0.1),
+        noise: float = 0.0,
+    ) -> Self:
+        """Create a IMU orientation observation from a physics model.
+
+        Args:
+            physics_model: MuJoCo physics model
+            framequat_name: The name of the framequat sensor
+            lag_range: The range of EMA factors to use, to approximate the
+                variation in the amount of smoothing of the Kalman filter.
+            noise: The observation noise
+        """
+        sensor_name_to_idx_range = ksim.get_sensor_data_idxs_by_name(physics_model)
+        if framequat_name not in sensor_name_to_idx_range:
+            options = "\n".join(sorted(sensor_name_to_idx_range.keys()))
+            raise ValueError(f"{framequat_name} not found in model. Available:\n{options}")
+
+        return cls(
+            framequat_idx_range=sensor_name_to_idx_range[framequat_name],
+            lag_range=lag_range,
+            noise=noise,
+        )
+
+    def initial_carry(self, physics_state: ksim.PhysicsState, rng: PRNGKeyArray) -> tuple[Array, Array]:
+        minval, maxval = self.lag_range
+        return jnp.zeros((4,)), jax.random.uniform(rng, (1,), minval=minval, maxval=maxval)
+
+    def observe_stateful(
+        self,
+        state: ksim.ObservationInput,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> tuple[Array, tuple[Array, Array]]:
+        framequat_start, framequat_end = self.framequat_idx_range
+        framequat_data = state.physics_state.data.sensordata[framequat_start:framequat_end].ravel()
+
+        # Add noise
+        # # BUG? noise is added twice? also in ksim rl.py
+        # framequat_data = add_noise(framequat_data, rng, "gaussian", self.noise, curriculum_level)
+
+        # get heading cmd
+        heading_yaw_cmd = state.commands["unified_command"][3]
+
+        # spin back
+        heading_yaw_cmd_quat = xax.euler_to_quat(jnp.array([0.0, 0.0, heading_yaw_cmd]))
+        backspun_framequat = rotate_quat_by_quat(framequat_data, heading_yaw_cmd_quat, inverse=True)
+        # ensure positive quat hemisphere
+        backspun_framequat = jnp.where(backspun_framequat[..., 0] < 0, -backspun_framequat, backspun_framequat)
+
+        # Get current Kalman filter state
+        x, lag = state.obs_carry
+        x = x * lag + backspun_framequat * (1 - lag)
+
+        return x, (x, lag)
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -688,18 +998,13 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.BaseAngularVelocityObservation(),
             ksim.BaseLinearAccelerationObservation(),
             ksim.BaseAngularAccelerationObservation(),
-            ksim.ProjectedGravityObservation.create(
+            ImuOrientationObservation.create(
                 physics_model=physics_model,
                 framequat_name="imu_site_quat",
-                lag_range=(0.0, 0.05),
+                lag_range=(0.0, 0.1),
                 noise=math.radians(1),
             ),
             ksim.ActuatorAccelerationObservation(),
-            ksim.BasePositionObservation(),
-            ksim.BaseOrientationObservation(),
-            ksim.BaseLinearVelocityObservation(),
-            ksim.BaseAngularVelocityObservation(),
-            ksim.CenterOfMassVelocityObservation(),
             ksim.SensorObservation.create(
                 physics_model=physics_model,
                 sensor_name="imu_acc",
@@ -727,8 +1032,18 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
         return [
-            ksim.JoystickCommand(
-                sample_probs=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),  # Always "stand still" during training
+            UnifiedCommand(
+                vx_range=(-0.75, 2.0),  # m/s
+                vy_range=(-0.5, 0.5),  # m/s
+                wz_range=(-0.5, 0.5),  # rad/s
+                # bh_range=(-0.05, 0.05), # m
+                bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
+                bh_standing_range=(-0.2, 0.0), # m
+                # bh_standing_range=(0.0, 0.0),  # m
+                rx_range=(-0.5, 0.5),  # rad
+                ry_range=(-0.5, 0.5),  # rad
+                ctrl_dt=self.config.ctrl_dt,
+                switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
             ),
         ]
 
@@ -785,24 +1100,17 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     ) -> tuple[distrax.Distribution, Array]:
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
-        proj_grav_3 = observations["projected_gravity_observation"]
-        cmd_7       = commands["joystick_command"]          # shape (...,7)
-
-        def maybe_drop(x: Array, p: float, key: PRNGKeyArray) -> Array:
-            mask = jax.random.bernoulli(key, p, x.shape)
-            return jnp.where(mask, 0.0, x)
-
-        # Occasionally zeroing the gravity vector forces the policy to back‑up
-        # on joint encoders / base‑quat and stops it from keying on one cue
-        rng, sub = jax.random.split(rng)
-        proj_grav_3 = maybe_drop(proj_grav_3, p=0.0, key=sub)  # don't drop for now
+        imu_quat_4 = observations["imu_orientation_observation"]
+        cmd = commands["unified_command"]          # shape (...,7)
 
         obs_n = jnp.concatenate(
             [
                 joint_pos_n,  # NUM_JOINTS
                 joint_vel_n,  # NUM_JOINTS
-                proj_grav_3,  # 3
-                cmd_7,        # 7
+                imu_quat_4,   # 4
+                cmd[..., :2],      # vx, vy
+                cmd[..., 3:4],     # heading   (index 3)
+                cmd[..., 4:],      # bh, rx, ry
             ],
             axis=-1,
         )
@@ -824,8 +1132,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         com_vel_n = observations["center_of_mass_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        proj_grav_3 = observations["projected_gravity_observation"]
-        cmd_7       = commands["joystick_command"]
+        imu_quat_4 = observations["imu_orientation_observation"]
+        cmd_7       = commands["unified_command"]  # still 7 elements for critic
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
@@ -838,7 +1146,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 com_vel_n,  # 96
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
-                proj_grav_3,  # 3
+                imu_quat_4,  # 4
                 cmd_7,  # 7
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
