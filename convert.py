@@ -30,8 +30,7 @@ def main() -> None:
     mujoco_model = task.get_mujoco_model()
     joint_names = ksim.get_joint_names_in_order(mujoco_model)[1:]  # Removes the root joint.
 
-    # TODO: Don't hardcode this.
-    num_commands: int = 3
+    num_commands: int = 7
 
     # Constant values.
     carry_shape = (task.config.depth, task.config.hidden_size)
@@ -52,12 +51,10 @@ def main() -> None:
         carry: Array,
     ) -> tuple[Array, Array]:
         obs_components = [
-            jnp.sin(time),
-            jnp.cos(time),
             joint_angles,
             joint_angular_velocities,
             projected_gravity,
-            command,
+            command[..., :num_commands],   # 7-D slice
         ]
 
         # if task.config.use_acc_gyro:
