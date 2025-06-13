@@ -1393,7 +1393,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             # ksim.UprightReward(scale=1.0),
 
             # --- command-tracking ---
-            LinearVelocityTrackingReward(scale=0.8,  error_scale=0.2),
+            LinearVelocityTrackingReward(scale=1.2,  error_scale=0.2),
             AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             XYOrientationReward(scale=0.2,          error_scale=0.03),
             BaseHeightReward(scale=0.1,             error_scale=0.05,
@@ -1413,15 +1413,15 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 touchdown_penalty=0.6,
             ),
             FeetOrientationReward(scale=0.1, error_scale=0.25),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
-            AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
-            ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
-            ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
-                scale=-0.03,
-                sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
-            ),
+            # StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
+            #     scale=-0.03,
+            #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
+            # ),
             ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
         ]
 
