@@ -262,24 +262,25 @@ class UnifiedCommand(ksim.Command):
             ),
         ]
 
-
 @attrs.define(frozen=True)
 class ConstantForwardCommand(ksim.Command):
     vx: float
     ctrl_dt: float
 
-    # use the same external name everywhere
-    def get_name(self) -> str:          # overrides base implementation
-        return COMMAND_NAME             # "forward_only_command"
+    def get_name(self) -> str:
+        return COMMAND_NAME
 
-    def initial_command(self, physics_data, *_):
-        heading = xax.quat_to_euler(physics_data.xquat[1])[2]
+    @staticmethod
+    def _current_heading(physics_data: PhysicsData) -> Array:
+        return xax.quat_to_euler(physics_data.xquat[1])[2]
+
+    def initial_command(self, physics_data, *_) -> Array:
+        heading = self._current_heading(physics_data)
         return jnp.array([self.vx, 0.0, 0.0, heading, 0.0, 0.0, 0.0])
 
-    # never changes after the first step
-    def __call__(self, prev_command, *args, **kwargs):
-        return prev_command
-
+    def __call__(self, prev_command, physics_data, *_) -> Array:
+        heading = self._current_heading(physics_data)
+        return prev_command.at[3].set(heading)
 
 
 @attrs.define(frozen=True, kw_only=True)
