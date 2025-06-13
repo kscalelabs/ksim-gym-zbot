@@ -537,13 +537,12 @@ class ArmPosePenalty(JointPositionPenalty):
                 "left_shoulder_pitch",
                 "left_shoulder_roll",
                 "left_elbow_roll",
-                "left_gripper_roll"
+                "left_gripper_roll",
                 # right arm
                 "right_shoulder_pitch",
                 "right_shoulder_roll",
                 "right_elbow_roll",
-                "right_gripper_roll"
-
+                "right_gripper_roll",
             ],
             physics_model=physics_model,
             scale=scale,
