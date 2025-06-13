@@ -557,6 +557,20 @@ class SimpleSingleFootContactReward(ksim.Reward):
         return reward
 
 
+@attrs.define(frozen=True, kw_only=True)
+class ContactForcePenalty(ksim.Reward):
+    """Penalises vertical forces above threshold."""
+
+    scale: float = -1.0
+    max_contact_force: float = 350.0
+    sensor_names: tuple[str, ...]
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        forces = jnp.stack([traj.obs[n] for n in self.sensor_names], axis=-1)
+        cost = jnp.clip(jnp.abs(forces[:, 2, :]) - self.max_contact_force, 0)
+        return jnp.sum(cost, axis=-1)
+
+
 def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
     """Rotates one quaternion by another quaternion through quaternion multiplication.
 
@@ -1261,8 +1275,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
             ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.0),
-            # ksim.RandomJointVelocityReset(),
-            # ksim.RandomHeadingReset(),
+            ksim.RandomJointVelocityReset(),
+            ksim.RandomHeadingReset(),
         ]
 
     def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
@@ -1375,11 +1389,17 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
             ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
             ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
+                scale=-0.03,
+                sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
+            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
         return [
             ksim.BadZTermination(unhealthy_z_lower=0.05, unhealthy_z_upper=0.5),
+            ksim.NotUprightTermination(max_radians=math.radians(60)),
+            ksim.EpisodeLengthTermination(max_length_sec=80),
         ]
 
     def get_curriculum(self, physics_model):
