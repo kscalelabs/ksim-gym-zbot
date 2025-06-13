@@ -22,6 +22,8 @@ from ksim.actuators import NoiseType, StatefulActuators
 from ksim.types import Metadata, PhysicsData
 from ksim.utils.mujoco import get_ctrl_data_idx_by_name
 
+from jaxtyping import Array, PRNGKeyArray, PyTree
+
 logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 20
@@ -260,6 +262,7 @@ class UnifiedCommand(ksim.Command):
         ]
 
 
+
 @attrs.define(frozen=True, kw_only=True)
 class LinearVelocityTrackingReward(ksim.Reward):
     """Reward for tracking the linear velocity."""
@@ -349,6 +352,43 @@ class XYOrientationReward(ksim.Reward):
 
 
 @attrs.define(frozen=True)
+class FeetPositionObservation(ksim.Observation):
+    foot_left_idx: int
+    foot_right_idx: int
+    floor_threshold: float = 0.0
+    in_robot_frame: bool = True
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        physics_model: ksim.PhysicsModel,
+        foot_left_site_name: str,
+        foot_right_site_name: str,
+        floor_threshold: float = 0.0,
+        in_robot_frame: bool = True,
+    ) -> Self:
+        fl = ksim.get_site_data_idx_from_name(physics_model, foot_left_site_name)
+        fr = ksim.get_site_data_idx_from_name(physics_model, foot_right_site_name)
+        return cls(foot_left_idx=fl, foot_right_idx=fr, floor_threshold=floor_threshold, in_robot_frame=in_robot_frame)
+
+    def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
+        fl_ndarray = ksim.get_site_pose(state.physics_state.data, self.foot_left_idx)[0] + jnp.array(
+            [0.0, 0.0, self.floor_threshold]
+        )
+        fr_ndarray = ksim.get_site_pose(state.physics_state.data, self.foot_right_idx)[0] + jnp.array(
+            [0.0, 0.0, self.floor_threshold]
+        )
+
+        if self.in_robot_frame:
+            # Transform foot positions to robot frame
+            base_quat = state.physics_state.data.qpos[3:7]  # Base quaternion
+            fl = xax.rotate_vector_by_quat(jnp.array(fl_ndarray), base_quat, inverse=True)
+            fr = xax.rotate_vector_by_quat(jnp.array(fr_ndarray), base_quat, inverse=True)
+
+        return jnp.concatenate([fl, fr], axis=-1)
+
+@attrs.define(frozen=True)
 class BaseHeightReward(ksim.Reward):
     """Reward for keeping the base height at the commanded height."""
 
@@ -363,6 +403,64 @@ class BaseHeightReward(ksim.Reward):
         # is_zero_cmd = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < 1e-3
         # height_error = jnp.where(is_zero_cmd, height_error, height_error**2)  # smooth kernel for walking.
         return jnp.exp(-height_error / self.error_scale)
+    
+
+@attrs.define(frozen=True, kw_only=True)
+class FeetAirtimeReward(ksim.StatefulReward):
+    """Encourages reasonable step frequency by rewarding long swing phases and penalizing quick stepping."""
+
+    scale: float = 1.0
+    ctrl_dt: float = 0.02
+    touchdown_penalty: float = 0.4
+    scale_by_curriculum: bool = False
+
+    def initial_carry(self, rng: PRNGKeyArray) -> PyTree:
+        # initial left and right airtime
+        return jnp.array([0.0, 0.0])
+
+    def _airtime_sequence(self, initial_airtime: Array, contact_bool: Array, done: Array) -> tuple[Array, Array]:
+        """Returns an array with the airtime (in seconds) for each timestep."""
+
+        def _body(time_since_liftoff: Array, is_contact: Array) -> tuple[Array, Array]:
+            new_time = jnp.where(is_contact, 0.0, time_since_liftoff + self.ctrl_dt)
+            return new_time, new_time
+
+        # or with done to reset the airtime counter when the episode is done
+        contact_or_done = jnp.logical_or(contact_bool, done)
+        carry, airtime = jax.lax.scan(_body, initial_airtime, contact_or_done)
+        return carry, airtime
+
+    def get_reward_stateful(self, traj: ksim.Trajectory, reward_carry: PyTree) -> tuple[Array, PyTree]:
+        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False)[:, 0]
+        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False)[:, 0]
+
+        # airtime counters
+        left_carry, left_air = self._airtime_sequence(reward_carry[0], left_contact, traj.done)
+        right_carry, right_air = self._airtime_sequence(reward_carry[1], right_contact, traj.done)
+
+        reward_carry = jnp.array([left_carry, right_carry])
+
+        # touchdown boolean (0→1 transition)
+        def touchdown(c: Array) -> Array:
+            prev = jnp.concatenate([jnp.array([False]), c[:-1]])
+            return jnp.logical_and(c, jnp.logical_not(prev))
+
+        td_l = touchdown(left_contact)
+        td_r = touchdown(right_contact)
+
+        left_air_shifted = jnp.roll(left_air, 1)
+        right_air_shifted = jnp.roll(right_air, 1)
+
+        left_feet_airtime_reward = (left_air_shifted - self.touchdown_penalty) * td_l.astype(jnp.float32)
+        right_feet_airtime_reward = (right_air_shifted - self.touchdown_penalty) * td_r.astype(jnp.float32)
+
+        reward = left_feet_airtime_reward + right_feet_airtime_reward
+
+        # standing mask
+        is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
+        reward = jnp.where(is_zero_cmd, 0.0, reward)
+
+        return reward, reward_carry
 
 @attrs.define(frozen=True, kw_only=True)
 class JointPositionPenalty(ksim.JointDeviationPenalty):
@@ -384,6 +482,64 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
             scale=scale,
             scale_by_curriculum=scale_by_curriculum,
         )
+
+@attrs.define(frozen=True, kw_only=True)
+class StraightLegPenalty(JointPositionPenalty):
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -1.0,
+        scale_by_curriculum: bool = False,
+    ) -> Self:
+        return cls.create_from_names(
+            names=[
+                "left_hip_roll",
+                "left_hip_yaw",
+                "right_hip_roll",
+                "right_hip_yaw",
+            ],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+
+
+class AnkleKneePenalty(JointPositionPenalty):
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -1.0,
+        scale_by_curriculum: bool = False,
+    ) -> Self:
+        return cls.create_from_names(
+            names=["left_knee_pitch", "left_ankle_pitch", "right_knee_pitch", "right_ankle_pitch"],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+
+
+@attrs.define(frozen=True)
+class FeetOrientationReward(ksim.Reward):
+    """Reward for keeping feet pitch and roll oriented parallel to the ground."""
+
+    scale: float = attrs.field(default=1.0)
+    error_scale: float = attrs.field(default=0.25)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        left_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 23, :])
+        right_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 18, :])
+
+        straight_foot_euler = jnp.stack([-jnp.pi / 2, 0], axis=-1)  # ignore yaw
+
+        left_error = jnp.abs(left_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
+        right_error = jnp.abs(right_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
+
+        total_error = left_error + right_error
+        return jnp.exp(-total_error / self.error_scale)
+
 
 @attrs.define(frozen=True, kw_only=True)
 class SimpleSingleFootContactReward(ksim.Reward):
@@ -1146,6 +1302,15 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         obs_list += [
             ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch",  noise=0.0),
             ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_force",  noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_force", noise=0.0),
+            FeetPositionObservation.create(
+                physics_model=physics_model,
+                foot_left_site_name="left_foot",
+                foot_right_site_name="right_foot",
+                floor_threshold=0.0,
+                in_robot_frame=True,
+            )
         ]
 
 
@@ -1194,11 +1359,22 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             SimpleSingleFootContactReward(scale=0.3),
 
             # keep the old posture prior (optional)
-            JointPositionPenalty.create_from_names(
-                physics_model=physics_model,
-                names=[name for name, _ in ZEROS],
-                scale=-0.1,
+            # JointPositionPenalty.create_from_names(
+            #     physics_model=physics_model,
+            #     names=[name for name, _ in ZEROS],
+            #     scale=-0.1,
+            # ),
+            FeetAirtimeReward(
+                scale=2.5,
+                ctrl_dt=self.config.ctrl_dt,
+                touchdown_penalty=0.6,
             ),
+            FeetOrientationReward(scale=0.1, error_scale=0.25),
+            StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
+            ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
+            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1206,10 +1382,13 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.BadZTermination(unhealthy_z_lower=0.05, unhealthy_z_upper=0.5),
         ]
 
-    def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
-        return ksim.LinearCurriculum(
-            step_size=0.0,
-            step_every_n_epochs=10,
+    def get_curriculum(self, physics_model):
+        return ksim.EpisodeLengthCurriculum(
+            num_levels=30,
+            increase_threshold=30.0,
+            decrease_threshold=10.0,
+            min_level_steps=10,
+            min_level=0.5,
         )
 
     def get_model(self, key: PRNGKeyArray) -> Model:
