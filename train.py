@@ -520,6 +520,36 @@ class AnkleKneePenalty(JointPositionPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+@attrs.define(frozen=True, kw_only=True)
+class ArmPosePenalty(JointPositionPenalty):
+    """Keeps the arm joints near the reference pose in ZEROS."""
+
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -0.05,          # tune to taste (-ve = penalty)
+        scale_by_curriculum: bool = True,
+    ) -> "ArmPosePenalty":
+        return cls.create_from_names(
+            names=[
+                # left arm
+                "left_shoulder_pitch",
+                "left_shoulder_roll",
+                "left_elbow_roll",
+                "left_gripper_roll"
+                # right arm
+                "right_shoulder_pitch",
+                "right_shoulder_roll",
+                "right_elbow_roll",
+                "right_gripper_roll"
+
+            ],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+        
 
 @attrs.define(frozen=True)
 class FeetOrientationReward(ksim.Reward):
@@ -1393,6 +1423,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 scale=-0.03,
                 sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
             ),
+            ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
