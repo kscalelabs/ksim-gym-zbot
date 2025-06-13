@@ -1390,7 +1390,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return obs_list
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        fwd_speed = 3.30          # m/s – choose whatever “max” you want
+        fwd_speed = 2.0          # m/s – choose whatever “max” you want
 
         return [
             # UnifiedCommand(
@@ -1419,7 +1419,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             # ksim.UprightReward(scale=1.0),
 
             # --- command-tracking ---
-            LinearVelocityTrackingReward(scale=3.8,  error_scale=0.2),
+            LinearVelocityTrackingReward(scale=2.0,  error_scale=0.87),
             # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             # XYOrientationReward(scale=0.2,          error_scale=0.03),
             # BaseHeightReward(scale=0.1,             error_scale=0.05,
