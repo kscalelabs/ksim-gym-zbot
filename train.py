@@ -32,6 +32,7 @@ NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS           # 50
 # Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
 NUM_CRITIC_INPUTS = 484   # 340
 
+COMMAND_NAME = "forward_only_command"
 
 def get_servo_deadband() -> tuple[float, float]:
     """Get deadband values based on current servo configuration."""
@@ -262,6 +263,24 @@ class UnifiedCommand(ksim.Command):
         ]
 
 
+@attrs.define(frozen=True)
+class ConstantForwardCommand(ksim.Command):
+    vx: float
+    ctrl_dt: float
+
+    # use the same external name everywhere
+    def get_name(self) -> str:          # overrides base implementation
+        return COMMAND_NAME             # "forward_only_command"
+
+    def initial_command(self, physics_data, *_):
+        heading = xax.quat_to_euler(physics_data.xquat[1])[2]
+        return jnp.array([self.vx, 0.0, 0.0, heading, 0.0, 0.0, 0.0])
+
+    # never changes after the first step
+    def __call__(self, prev_command, *args, **kwargs):
+        return prev_command
+
+
 
 @attrs.define(frozen=True, kw_only=True)
 class LinearVelocityTrackingReward(ksim.Reward):
@@ -269,7 +288,7 @@ class LinearVelocityTrackingReward(ksim.Reward):
 
     error_scale: float = attrs.field(default=0.25)
     linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
-    command_name: str = attrs.field(default="unified_command")
+    command_name: str = attrs.field(default=COMMAND_NAME)
     norm: xax.NormType = attrs.field(default="l2")
     stand_still_threshold: float = attrs.field(default=1e-2)
 
@@ -296,7 +315,7 @@ class LinearVelocityTrackingReward(ksim.Reward):
         global_vel_xy = global_vel[:, :2]
 
         # now compute error. special trick: different kernels for standing and walking.
-        zero_cmd_mask = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < self.stand_still_threshold
+        zero_cmd_mask = jnp.linalg.norm(trajectory.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
         vel_error = jnp.linalg.norm(global_vel_xy - global_vel_xy_cmd, axis=-1)
         error = jnp.where(zero_cmd_mask, vel_error, 2 * jnp.square(vel_error))
         return jnp.exp(-error / self.error_scale)
@@ -307,7 +326,7 @@ class AngularVelocityTrackingReward(ksim.Reward):
     """Reward for tracking the heading using quaternion-based error computation."""
 
     error_scale: float = attrs.field(default=0.25)
-    command_name: str = attrs.field(default="unified_command")
+    command_name: str = attrs.field(default=COMMAND_NAME)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         base_yaw = xax.quat_to_euler(trajectory.xquat[:, 1, :])[:, 2]
@@ -330,7 +349,7 @@ class XYOrientationReward(ksim.Reward):
     """Reward for tracking the xy base orientation using quaternion-based error computation."""
 
     error_scale: float = attrs.field(default=0.25)
-    command_name: str = attrs.field(default="unified_command")
+    command_name: str = attrs.field(default=COMMAND_NAME)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         euler_orientation = xax.quat_to_euler(trajectory.xquat[:, 1, :])
@@ -397,7 +416,7 @@ class BaseHeightReward(ksim.Reward):
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         current_height = trajectory.xpos[:, 1, 2]  # 1st body, because world is 0. 2nd element is z.
-        commanded_height = trajectory.command["unified_command"][:, 4] + self.standard_height
+        commanded_height = trajectory.command[COMMAND_NAME][:, 4] + self.standard_height
 
         height_error = jnp.abs(current_height - commanded_height)
         # is_zero_cmd = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < 1e-3
@@ -457,7 +476,7 @@ class FeetAirtimeReward(ksim.StatefulReward):
         reward = left_feet_airtime_reward + right_feet_airtime_reward
 
         # standing mask
-        is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
+        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
         reward = jnp.where(is_zero_cmd, 0.0, reward)
 
         return reward, reward_carry
@@ -581,7 +600,7 @@ class SimpleSingleFootContactReward(ksim.Reward):
         right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
         single = jnp.logical_xor(left_contact, right_contact).squeeze()
 
-        is_zero_cmd = jnp.linalg.norm(traj.command["unified_command"][:, :3], axis=-1) < 1e-3
+        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
         reward = jnp.where(is_zero_cmd, 1.0, single)
         return reward
 
@@ -709,7 +728,7 @@ class ImuOrientationObservation(ksim.StatefulObservation):
         # framequat_data = add_noise(framequat_data, rng, "gaussian", self.noise, curriculum_level)
 
         # get heading cmd
-        heading_yaw_cmd = state.commands["unified_command"][3]
+        heading_yaw_cmd = state.commands[COMMAND_NAME][3]
 
         # spin back
         heading_yaw_cmd_quat = xax.euler_to_quat(jnp.array([0.0, 0.0, heading_yaw_cmd]))
@@ -1289,16 +1308,16 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
-            #    ksim.PushEvent(
-            #        x_linvel=0.1,
-            #        y_linvel=0.1,
-            #        z_linvel=0.05,
-            #        x_angvel=0.0,  # angular velocity in rad/s
-            #        y_angvel=0.0,
-            #        z_angvel=0.0,
-            #        vel_range=(0.05, 0.15),
-            #        interval_range=(2.0, 4.0)
-            #    ),
+               ksim.PushEvent(
+                   x_linvel=0.1,
+                   y_linvel=0.1,
+                   z_linvel=0.05,
+                   x_angvel=0.0,  # angular velocity in rad/s
+                   y_angvel=0.0,
+                   z_angvel=0.0,
+                   vel_range=(0.05, 0.15),
+                   interval_range=(2.0, 4.0)
+               ),
         ]
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
@@ -1371,20 +1390,27 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return obs_list
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
+        fwd_speed = 3.30          # m/s – choose whatever “max” you want
+
         return [
-            UnifiedCommand(
-                vx_range=(-0.1, 0.3),  # m/s
-                vy_range=(-0.075, 0.075),  # m/s
-                wz_range=(-0.5, 0.5),  # rad/s
-                # bh_range=(-0.05, 0.05), # m
-                bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
-                bh_standing_range=(0.0, 0.0), # m
-                # bh_standing_range=(0.0, 0.0),  # m
-                rx_range=(-0.0, 0.0),  # rad
-                ry_range=(-0.0, 0.0),  # rad
+            # UnifiedCommand(
+            #     vx_range=(-0.1, 0.3),  # m/s
+            #     vy_range=(-0.075, 0.075),  # m/s
+            #     wz_range=(-0.5, 0.5),  # rad/s
+            #     # bh_range=(-0.05, 0.05), # m
+            #     bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
+            #     bh_standing_range=(0.0, 0.0), # m
+            #     # bh_standing_range=(0.0, 0.0),  # m
+            #     rx_range=(-0.0, 0.0),  # rad
+            #     ry_range=(-0.0, 0.0),  # rad
+            #     ctrl_dt=self.config.ctrl_dt,
+            #     switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
+            # ),
+            
+            ConstantForwardCommand(
+                vx=fwd_speed,
                 ctrl_dt=self.config.ctrl_dt,
-                switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
-            ),
+            )
         ]
 
     def get_rewards(self, physics_model):
@@ -1393,13 +1419,13 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             # ksim.UprightReward(scale=1.0),
 
             # --- command-tracking ---
-            LinearVelocityTrackingReward(scale=0.8,  error_scale=0.2),
-            AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
-            XYOrientationReward(scale=0.2,          error_scale=0.03),
-            BaseHeightReward(scale=0.1,             error_scale=0.05,
-                            standard_height=0.27),          # adjust if COM is lower
+            LinearVelocityTrackingReward(scale=3.8,  error_scale=0.2),
+            # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
+            # XYOrientationReward(scale=0.2,          error_scale=0.03),
+            # BaseHeightReward(scale=0.1,             error_scale=0.05,
+            #                 standard_height=0.27),          # adjust if COM is lower
 
-            SimpleSingleFootContactReward(scale=0.3),
+            # SimpleSingleFootContactReward(scale=0.3),
 
             # keep the old posture prior (optional)
             # JointPositionPenalty.create_from_names(
@@ -1407,22 +1433,22 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     names=[name for name, _ in ZEROS],
             #     scale=-0.1,
             # ),
-            FeetAirtimeReward(
-                scale=2.5,
-                ctrl_dt=self.config.ctrl_dt,
-                touchdown_penalty=0.6,
-            ),
-            FeetOrientationReward(scale=0.1, error_scale=0.25),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
-            AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
-            ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
-            ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
-                scale=-0.03,
-                sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
-            ),
-            ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # FeetAirtimeReward(
+            #     scale=2.5,
+            #     ctrl_dt=self.config.ctrl_dt,
+            #     touchdown_penalty=0.3,
+            # ),
+            # FeetOrientationReward(scale=0.1, error_scale=0.25),
+            # StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
+            #     scale=-0.03,
+            #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
+            # ),
+            # ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1464,7 +1490,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         imu_quat_4 = observations["imu_orientation_observation"]
-        cmd = commands["unified_command"]          # shape (...,7)
+        cmd = commands[COMMAND_NAME]          # shape (...,7)
 
         obs_n = jnp.concatenate(
             [
@@ -1496,7 +1522,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         imu_quat_4 = observations["imu_orientation_observation"]
-        cmd_7       = commands["unified_command"]  # still 7 elements for critic
+        cmd_7       = commands[COMMAND_NAME]  # still 7 elements for critic
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
@@ -1610,6 +1636,7 @@ if __name__ == "__main__":
             # Training parameters.
             num_envs=2048,
             batch_size=256,
+            learning_rate=1e-3,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
