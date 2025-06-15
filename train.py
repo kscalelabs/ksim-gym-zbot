@@ -323,6 +323,54 @@ class LinearVelocityTrackingReward(ksim.Reward):
 
 
 @attrs.define(frozen=True, kw_only=True)
+class L1LinearVelocityTrackingReward(ksim.Reward):
+    """Reward that grows *linearly* as the XY speed approaches the command."""
+
+    # --- you can re-use the old fields, but error_scale now means “slope” --------
+    slope: float = attrs.field(default=1.0)          # 1.0 → reward rises 1 unit per 1 m/s of error reduction
+    linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
+    command_name: str = attrs.field(default=COMMAND_NAME)
+    stand_still_threshold: float = attrs.field(default=1e-2)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        if self.linvel_obs_name not in trajectory.obs:
+            raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
+
+        # -----------------------------------------------------------------------
+        # 1.  Global-frame velocities (same as before)
+        global_vel = trajectory.obs[self.linvel_obs_name]
+
+        base_euler   = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler   = base_euler.at[:, :2].set(0.0)          # keep only yaw
+        base_z_quat  = xax.euler_to_quat(base_euler)
+
+        robot_vel_cmd  = jnp.zeros_like(global_vel).at[:, :2].set(
+            trajectory.command[self.command_name][:, :2]
+        )
+        
+        global_vel_cmd = xax.rotate_vector_by_quat(robot_vel_cmd, base_z_quat, inverse=False)
+
+        global_vel_xy      = global_vel[:, :2]
+        global_vel_xy_cmd  = global_vel_cmd[:, :2]
+
+        # -----------------------------------------------------------------------
+        # 2.  Linear “cone” reward  (–‖error‖  →  maximise ⇒ minimise error)
+        vel_error = jnp.linalg.norm(global_vel_xy - global_vel_xy_cmd, axis=-1)
+
+        # A.  Standing still kernel (optional – same trick you had)
+        zero_cmd_mask = (
+            jnp.linalg.norm(trajectory.command[self.command_name][:, :3], axis=-1)
+            < self.stand_still_threshold
+        )
+
+        # Reward is –‖error‖ for walking,  –‖vel‖ for stand-still
+        # (negative sign because RL maximises reward)
+        walk_reward  = -self.slope * vel_error
+        stand_reward = -self.slope * jnp.linalg.norm(global_vel_xy, axis=-1)
+
+        return jnp.where(zero_cmd_mask, stand_reward, walk_reward)
+
+@attrs.define(frozen=True, kw_only=True)
 class AngularVelocityTrackingReward(ksim.Reward):
     """Reward for tracking the heading using quaternion-based error computation."""
 
@@ -1418,10 +1466,10 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return [
             ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=1.0),
-            ksim.NaiveForwardReward(scale=1.0),
+            # ksim.NaiveForwardReward(scale=1.0),
 
             # --- command-tracking ---
-            # LinearVelocityTrackingReward(scale=5.0,  error_scale=0.87),
+            L1LinearVelocityTrackingReward(scale=1.0),
             # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             # XYOrientationReward(scale=0.2,          error_scale=0.03),
             # BaseHeightReward(scale=0.1,             error_scale=0.05,
@@ -1435,12 +1483,12 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     names=[name for name, _ in ZEROS],
             #     scale=-0.1,
             # ),
-            # FeetAirtimeReward(
-            #     scale=2.5,
-            #     ctrl_dt=self.config.ctrl_dt,
-            #     touchdown_penalty=0.3,
-            # ),
-            # FeetOrientationReward(scale=0.1, error_scale=0.25),
+            FeetAirtimeReward(
+                scale=2.5,
+                ctrl_dt=self.config.ctrl_dt,
+                touchdown_penalty=0.3,
+            ),
+            FeetOrientationReward(scale=0.1, error_scale=0.25),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
