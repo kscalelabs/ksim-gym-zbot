@@ -22,12 +22,17 @@ from ksim.actuators import NoiseType, StatefulActuators
 from ksim.types import Metadata, PhysicsData
 from ksim.utils.mujoco import get_ctrl_data_idx_by_name
 
+from jaxtyping import Array, PRNGKeyArray, PyTree
+
 logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 20
-NUM_ACTOR_INPUTS = 43
-NUM_CRITIC_INPUTS = 476
+NUM_COMMANDS = 6
+NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS           # 50
+# Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
+NUM_CRITIC_INPUTS = 484   # 340
 
+COMMAND_NAME = "forward_only_command"
 
 def get_servo_deadband() -> tuple[float, float]:
     """Get deadband values based on current servo configuration."""
@@ -43,23 +48,23 @@ def get_servo_deadband() -> tuple[float, float]:
 ZEROS: list[tuple[str, float]] = [
     ("right_hip_yaw", 0.0),
     ("right_hip_roll", 0.0),
-    ("right_hip_pitch", 0.0),
-    ("right_knee_pitch", 0.0),
-    ("right_ankle_pitch", 0.0),
+    ("right_hip_pitch", -0.4),
+    ("right_knee_pitch", -0.8),
+    ("right_ankle_pitch", -0.4),
     ("right_ankle_roll", 0.0),
     ("left_hip_yaw", 0.0),
     ("left_hip_roll", 0.0),
-    ("left_hip_pitch", 0.0),
-    ("left_knee_pitch", 0.0),
-    ("left_ankle_pitch", 0.0),
+    ("left_hip_pitch", -0.4),
+    ("left_knee_pitch", -0.8),
+    ("left_ankle_pitch", -0.4),
     ("left_ankle_roll", 0.0),
     ("left_shoulder_pitch", 0.0),
-    ("left_shoulder_roll", 0.0),
-    ("left_elbow_roll", 0.0),
+    ("left_shoulder_roll", 0.2),
+    ("left_elbow_roll", 0.2),
     ("left_gripper_roll", 0.0),
     ("right_shoulder_pitch", 0.0),
-    ("right_shoulder_roll", 0.0),
-    ("right_elbow_roll", 0.0),
+    ("right_shoulder_roll", -0.2),
+    ("right_elbow_roll", -0.2),
     ("right_gripper_roll", 0.0),
 ]
 
@@ -71,6 +76,463 @@ class PlannerState:
     velocity: Array
     last_computed_torque: Array
 
+@attrs.define(kw_only=True)
+class UnifiedLinearVelocityCommandMarker(ksim.vis.Marker):
+    """Visualise the planar (x,y) velocity command from unified command."""
+
+    command_name: str = attrs.field()
+    size: float = attrs.field(default=0.03)
+    arrow_scale: float = attrs.field(default=0.1)
+    height: float = attrs.field(default=0.5)
+    base_length: float = attrs.field(default=0.25)
+
+    def update(self, trajectory: ksim.Trajectory) -> None:
+        cmd = trajectory.command[self.command_name]
+        vx, vy = float(cmd[0]), float(cmd[1])
+        speed = (vx * vx + vy * vy) ** 0.5
+        self.pos = (0.0, 0.0, self.height)
+
+        # Always show arrow with base length plus scaling
+        self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+        arrow_length = self.base_length + self.arrow_scale * speed
+        self.scale = (self.size, self.size, arrow_length)
+
+        if speed < 1e-4:  # zero command → point forward, grey color
+            self.orientation = self.quat_from_direction((1.0, 0.0, 0.0))
+            self.rgba = (0.8, 0.8, 0.8, 0.8)
+        else:  # non-zero command → point in command direction, green color
+            self.orientation = self.quat_from_direction((vx, vy, 0.0))
+            self.rgba = (0.2, 0.8, 0.2, 0.8)
+
+    @classmethod
+    def get(
+        cls,
+        command_name: str,
+        *,
+        arrow_scale: float = 0.1,
+        height: float = 0.5,
+        base_length: float = 0.25,
+    ) -> Self:
+        return cls(
+            command_name=command_name,
+            target_type="root",
+            geom=mujoco.mjtGeom.mjGEOM_ARROW,
+            scale=(0.03, 0.03, base_length),
+            arrow_scale=arrow_scale,
+            height=height,
+            base_length=base_length,
+            track_rotation=True,
+        )
+
+
+@attrs.define(kw_only=True)
+class UnifiedAbsoluteYawCommandMarker(ksim.vis.Marker):
+    """Visualise the absolute yaw command from unified command."""
+
+    command_name: str = attrs.field()
+    size: float = attrs.field(default=0.02)
+    height: float = attrs.field(default=0.7)
+    arrow_scale: float = attrs.field(default=0.1)
+    base_length: float = attrs.field(default=0.25)
+
+    def update(self, trajectory: ksim.Trajectory) -> None:
+        cmd = trajectory.command[self.command_name]
+        yaw = float(cmd[3])  # yaw command is in position 3
+        self.pos = (0.0, 0.0, self.height)
+
+        # Always show arrow with base length plus scaling
+        self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+        arrow_length = self.base_length + self.arrow_scale * abs(yaw)
+        self.scale = (self.size, self.size, arrow_length)
+
+        if abs(yaw) < 1e-4:  # zero command → point forward, grey color
+            self.orientation = self.quat_from_direction((1.0, 0.0, 0.0))
+            self.rgba = (0.8, 0.8, 0.8, 0.8)
+        else:  # non-zero command → point in yaw direction, blue color
+            # Convert yaw to direction vector (rotate around z-axis)
+            direction_x = jnp.cos(yaw)
+            direction_y = jnp.sin(yaw)
+            self.orientation = self.quat_from_direction((float(direction_x), float(direction_y), 0.0))
+            self.rgba = (0.2, 0.2, 0.8, 0.8)
+
+    @classmethod
+    def get(
+        cls,
+        command_name: str,
+        *,
+        arrow_scale: float = 0.1,
+        height: float = 0.7,
+        base_length: float = 0.25,
+    ) -> Self:
+        return cls(
+            command_name=command_name,
+            target_type="root",
+            geom=mujoco.mjtGeom.mjGEOM_ARROW,
+            scale=(0.02, 0.02, base_length),
+            arrow_scale=arrow_scale,
+            height=height,
+            base_length=base_length,
+            track_rotation=False,
+        )
+
+
+@attrs.define(frozen=True)
+class UnifiedCommand(ksim.Command):
+    """Unifiying all commands into one to allow for covariance control."""
+
+    vx_range: tuple[float, float] = attrs.field()
+    vy_range: tuple[float, float] = attrs.field()
+    wz_range: tuple[float, float] = attrs.field()
+    bh_range: tuple[float, float] = attrs.field()
+    bh_standing_range: tuple[float, float] = attrs.field()
+    rx_range: tuple[float, float] = attrs.field()
+    ry_range: tuple[float, float] = attrs.field()
+    ctrl_dt: float = attrs.field()
+    switch_prob: float = attrs.field()
+
+    def initial_command(self, physics_data: ksim.PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
+        rng_a, rng_b, rng_c, rng_d, rng_e, rng_f, rng_g, rng_h = jax.random.split(rng, 8)
+
+        # cmd  = [vx, vy, wz, bh, rx, ry]
+        vx = jax.random.uniform(rng_b, (1,), minval=self.vx_range[0], maxval=self.vx_range[1])
+        vy = jax.random.uniform(rng_c, (1,), minval=self.vy_range[0], maxval=self.vy_range[1])
+        wz = jax.random.uniform(rng_d, (1,), minval=self.wz_range[0], maxval=self.wz_range[1])
+        bh = jax.random.uniform(rng_e, (1,), minval=self.bh_range[0], maxval=self.bh_range[1])
+        bhs = jax.random.uniform(rng_f, (1,), minval=self.bh_standing_range[0], maxval=self.bh_standing_range[1])
+        rx = jax.random.uniform(rng_g, (1,), minval=self.rx_range[0], maxval=self.rx_range[1])
+        ry = jax.random.uniform(rng_h, (1,), minval=self.ry_range[0], maxval=self.ry_range[1])
+
+        # don't like super small velocity commands
+        vx = jnp.where(jnp.abs(vx) < 0.09, 0.0, vx)
+        vy = jnp.where(jnp.abs(vy) < 0.09, 0.0, vy)
+        wz = jnp.where(jnp.abs(wz) < 0.09, 0.0, wz)
+
+        _ = jnp.zeros_like(vx)
+
+        # Create each mode's command vector
+        forward_cmd = jnp.concatenate([vx, _, _, bh, _, _])
+        sideways_cmd = jnp.concatenate([_, vy, _, bh, _, _])
+        rotate_cmd = jnp.concatenate([_, _, wz, bh, _, _])
+        omni_cmd = jnp.concatenate([vx, vy, wz, bh, _, _])
+        stand_cmd = jnp.concatenate([_, _, _, bhs, rx, ry])
+
+        # randomly select a mode
+        mode = jax.random.randint(rng_a, (), minval=0, maxval=6) # 0 1 2 3 4s 5s -- 2/6 standing
+        cmd = jnp.where(mode == 0, forward_cmd,
+              jnp.where(mode == 1, sideways_cmd,
+              jnp.where(mode == 2, rotate_cmd,
+              jnp.where(mode == 3, omni_cmd,
+              stand_cmd))))
+
+        # get initial heading
+        init_euler = xax.quat_to_euler(physics_data.xquat[1])
+        init_heading = init_euler[2] + self.ctrl_dt * cmd[2]  # add 1 step of yaw vel cmd to initial heading.
+        cmd = jnp.concatenate([cmd[:3], jnp.array([init_heading]), cmd[3:]])
+        assert cmd.shape == (7,)
+
+        return cmd
+
+    def __call__(
+        self, prev_command: Array, physics_data: ksim.PhysicsData, curriculum_level: Array, rng: PRNGKeyArray
+    ) -> Array:
+        def update_heading(prev_command: Array) -> Array:
+            """Update the heading by integrating the angular velocity."""
+            wz_cmd, heading = prev_command[2], prev_command[3]
+            heading = heading + wz_cmd * self.ctrl_dt
+            prev_command = prev_command.at[3].set(heading)
+            return prev_command
+
+        continued_command = update_heading(prev_command)
+
+        rng_a, rng_b = jax.random.split(rng)
+        switch_mask = jax.random.bernoulli(rng_a, self.switch_prob)
+        new_command = self.initial_command(physics_data, curriculum_level, rng_b)
+        return jnp.where(switch_mask, new_command, continued_command)
+
+    def get_markers(self) -> list[ksim.vis.Marker]:
+        """Return markers for visualizing the unified command components."""
+        return [
+            UnifiedAbsoluteYawCommandMarker.get(
+                command_name=self.command_name,
+                height=0.7,
+            ),
+            UnifiedLinearVelocityCommandMarker.get(
+                command_name=self.command_name,
+                height=0.5,
+            ),
+        ]
+
+@attrs.define(frozen=True)
+class ConstantForwardCommand(ksim.Command):
+    vx: float
+    ctrl_dt: float
+
+    def get_name(self) -> str:
+        return COMMAND_NAME
+
+    @staticmethod
+    def _current_heading(physics_data: PhysicsData) -> Array:
+        return xax.quat_to_euler(physics_data.xquat[1])[2]
+
+    def initial_command(self, physics_data, *_) -> Array:
+        heading = self._current_heading(physics_data)
+        return jnp.array([self.vx, 0.0, 0.0, heading, 0.0, 0.0, 0.0])
+
+    def __call__(self, prev_command, physics_data, *_) -> Array:
+        heading = self._current_heading(physics_data)
+        return prev_command.at[3].set(heading)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class LinearVelocityTrackingReward(ksim.Reward):
+    """Reward for tracking the linear velocity."""
+
+    error_scale: float = attrs.field(default=0.25)
+    linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
+    command_name: str = attrs.field(default=COMMAND_NAME)
+    norm: xax.NormType = attrs.field(default="l2")
+    stand_still_threshold: float = attrs.field(default=1e-2)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # need to get lin vel obs from sensor, because xvel is not available in Trajectory.
+        if self.linvel_obs_name not in trajectory.obs:
+            raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
+
+        # Get global frame velocities
+        global_vel = trajectory.obs[self.linvel_obs_name]
+
+        # get base quat, only yaw.
+        # careful to only rotate in z, disregard rx and ry, bad conflict with roll and pitch.
+        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler = base_euler.at[:, :2].set(0.0)
+        base_z_quat = xax.euler_to_quat(base_euler)
+
+        # rotate local frame commands to global frame
+        robot_vel_cmd = jnp.zeros_like(global_vel).at[:, :2].set(trajectory.command[self.command_name][:, :2])
+        global_vel_cmd = xax.rotate_vector_by_quat(robot_vel_cmd, base_z_quat, inverse=False)
+
+        # drop vz. vz conflicts with base height reward.
+        global_vel_xy_cmd = global_vel_cmd[:, :2]
+        global_vel_xy = global_vel[:, :2]
+
+        # now compute error. special trick: different kernels for standing and walking.
+        zero_cmd_mask = jnp.linalg.norm(trajectory.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
+        vel_error = jnp.linalg.norm(global_vel_xy - global_vel_xy_cmd, axis=-1)
+        error = jnp.where(zero_cmd_mask, vel_error, 2 * jnp.square(vel_error))
+        return jnp.exp(-error / self.error_scale)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class L1LinearVelocityTrackingReward(ksim.Reward):
+    """Reward that grows *linearly* as the XY speed approaches the command."""
+
+    # --- you can re-use the old fields, but error_scale now means "slope" --------
+    slope: float = attrs.field(default=1.0)          # 1.0 → reward rises 1 unit per 1 m/s of error reduction
+    linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
+    command_name: str = attrs.field(default=COMMAND_NAME)
+    stand_still_threshold: float = attrs.field(default=1e-2)
+    target_bonus: float = attrs.field(default=2.0)    # Bonus for perfect tracking
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        if self.linvel_obs_name not in trajectory.obs:
+            raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
+
+        # -----------------------------------------------------------------------
+        # 1. Command in the ROBOT frame (unchanged)
+        global_vel = trajectory.obs[self.linvel_obs_name]
+        robot_vel_cmd = jnp.zeros_like(global_vel).at[:, :2].set(
+            trajectory.command[self.command_name][:, :2]        # [vx_cmd, vy_cmd]
+        )
+
+        # -----------------------------------------------------------------------
+        # 2. Rotate the *measured* velocity into the robot frame
+        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler = base_euler.at[:, :2].set(0.0)          # keep only yaw
+        base_z_quat = xax.euler_to_quat(base_euler)
+        vel_robot = xax.rotate_vector_by_quat(global_vel, base_z_quat, inverse=True)
+        vel_robot_xy = vel_robot[:, :2]                       # keep XY only
+
+        # -----------------------------------------------------------------------
+        # 3. L1 error in robot coordinates
+        diff_xy = vel_robot_xy - robot_vel_cmd[:, :2]
+        error = jnp.sum(xax.get_norm(diff_xy, "l1"), axis=-1)
+
+        # A.  Standing still kernel (optional – same trick you had)
+        zero_cmd_mask = (
+            jnp.linalg.norm(trajectory.command[self.command_name][:, :3], axis=-1)
+            < self.stand_still_threshold
+        )
+
+        # Reward is target_bonus - slope*error for walking, target_bonus - slope*vel for stand-still
+        # (negative sign because RL maximises reward)
+        walk_reward = self.target_bonus - self.slope * error
+        stand_reward = self.target_bonus - self.slope * jnp.sum(xax.get_norm(vel_robot_xy, "l1"), axis=-1)
+
+        # # Clip rewards to be non-negative
+        # walk_reward = jnp.maximum(0.0, walk_reward)
+        # stand_reward = jnp.maximum(0.0, stand_reward)
+
+        return jnp.where(zero_cmd_mask, stand_reward, walk_reward)
+
+@attrs.define(frozen=True, kw_only=True)
+class AngularVelocityTrackingReward(ksim.Reward):
+    """Reward for tracking the heading using quaternion-based error computation."""
+
+    error_scale: float = attrs.field(default=0.25)
+    command_name: str = attrs.field(default=COMMAND_NAME)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        base_yaw = xax.quat_to_euler(trajectory.xquat[:, 1, :])[:, 2]
+        base_yaw_cmd = trajectory.command[self.command_name][:, 3]
+
+        base_yaw_quat = xax.euler_to_quat(
+            jnp.stack([jnp.zeros_like(base_yaw_cmd), jnp.zeros_like(base_yaw_cmd), base_yaw], axis=-1)
+        )
+        base_yaw_target_quat = xax.euler_to_quat(
+            jnp.stack([jnp.zeros_like(base_yaw_cmd), jnp.zeros_like(base_yaw_cmd), base_yaw_cmd], axis=-1)
+        )
+
+        # Compute quaternion error
+        quat_error = 1 - jnp.sum(base_yaw_target_quat * base_yaw_quat, axis=-1) ** 2
+        return jnp.exp(-quat_error / self.error_scale)
+
+
+@attrs.define(frozen=True)
+class XYOrientationReward(ksim.Reward):
+    """Reward for tracking the xy base orientation using quaternion-based error computation."""
+
+    error_scale: float = attrs.field(default=0.25)
+    command_name: str = attrs.field(default=COMMAND_NAME)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        euler_orientation = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        euler_orientation = euler_orientation.at[:, 2].set(0.0)  # ignore yaw
+        base_xy_quat = xax.euler_to_quat(euler_orientation)
+
+        commanded_euler = jnp.stack(
+            [
+                trajectory.command[self.command_name][:, 5],
+                trajectory.command[self.command_name][:, 6],
+                jnp.zeros_like(trajectory.command[self.command_name][:, 6]),
+            ],
+            axis=-1,
+        )
+        base_xy_quat_cmd = xax.euler_to_quat(commanded_euler)
+
+        quat_error = 1 - jnp.sum(base_xy_quat_cmd * base_xy_quat, axis=-1) ** 2
+        return jnp.exp(-quat_error / self.error_scale)
+
+
+@attrs.define(frozen=True)
+class FeetPositionObservation(ksim.Observation):
+    foot_left_idx: int
+    foot_right_idx: int
+    floor_threshold: float = 0.0
+    in_robot_frame: bool = True
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        physics_model: ksim.PhysicsModel,
+        foot_left_site_name: str,
+        foot_right_site_name: str,
+        floor_threshold: float = 0.0,
+        in_robot_frame: bool = True,
+    ) -> Self:
+        fl = ksim.get_site_data_idx_from_name(physics_model, foot_left_site_name)
+        fr = ksim.get_site_data_idx_from_name(physics_model, foot_right_site_name)
+        return cls(foot_left_idx=fl, foot_right_idx=fr, floor_threshold=floor_threshold, in_robot_frame=in_robot_frame)
+
+    def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
+        fl_ndarray = ksim.get_site_pose(state.physics_state.data, self.foot_left_idx)[0] + jnp.array(
+            [0.0, 0.0, self.floor_threshold]
+        )
+        fr_ndarray = ksim.get_site_pose(state.physics_state.data, self.foot_right_idx)[0] + jnp.array(
+            [0.0, 0.0, self.floor_threshold]
+        )
+
+        if self.in_robot_frame:
+            # Transform foot positions to robot frame
+            base_quat = state.physics_state.data.qpos[3:7]  # Base quaternion
+            fl = xax.rotate_vector_by_quat(jnp.array(fl_ndarray), base_quat, inverse=True)
+            fr = xax.rotate_vector_by_quat(jnp.array(fr_ndarray), base_quat, inverse=True)
+
+        return jnp.concatenate([fl, fr], axis=-1)
+
+@attrs.define(frozen=True)
+class BaseHeightReward(ksim.Reward):
+    """Reward for keeping the base height at the commanded height."""
+
+    error_scale: float = attrs.field(default=0.25)
+    standard_height: float = attrs.field(default=0.27)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        current_height = trajectory.xpos[:, 1, 2]  # 1st body, because world is 0. 2nd element is z.
+        commanded_height = trajectory.command[COMMAND_NAME][:, 4] + self.standard_height
+
+        height_error = jnp.abs(current_height - commanded_height)
+        # is_zero_cmd = jnp.linalg.norm(trajectory.command["unified_command"][:, :3], axis=-1) < 1e-3
+        # height_error = jnp.where(is_zero_cmd, height_error, height_error**2)  # smooth kernel for walking.
+        return jnp.exp(-height_error / self.error_scale)
+    
+
+@attrs.define(frozen=True, kw_only=True)
+class FeetAirtimeReward(ksim.StatefulReward):
+    """Encourages reasonable step frequency by rewarding long swing phases and penalizing quick stepping."""
+
+    scale: float = 1.0
+    ctrl_dt: float = 0.02
+    touchdown_penalty: float = 0.4
+    scale_by_curriculum: bool = False
+
+    def initial_carry(self, rng: PRNGKeyArray) -> PyTree:
+        # initial left and right airtime
+        return jnp.array([0.0, 0.0])
+
+    def _airtime_sequence(self, initial_airtime: Array, contact_bool: Array, done: Array) -> tuple[Array, Array]:
+        """Returns an array with the airtime (in seconds) for each timestep."""
+
+        def _body(time_since_liftoff: Array, is_contact: Array) -> tuple[Array, Array]:
+            new_time = jnp.where(is_contact, 0.0, time_since_liftoff + self.ctrl_dt)
+            return new_time, new_time
+
+        # or with done to reset the airtime counter when the episode is done
+        contact_or_done = jnp.logical_or(contact_bool, done)
+        carry, airtime = jax.lax.scan(_body, initial_airtime, contact_or_done)
+        return carry, airtime
+
+    def get_reward_stateful(self, traj: ksim.Trajectory, reward_carry: PyTree) -> tuple[Array, PyTree]:
+        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False)[:, 0]
+        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False)[:, 0]
+
+        # airtime counters
+        left_carry, left_air = self._airtime_sequence(reward_carry[0], left_contact, traj.done)
+        right_carry, right_air = self._airtime_sequence(reward_carry[1], right_contact, traj.done)
+
+        reward_carry = jnp.array([left_carry, right_carry])
+
+        # touchdown boolean (0→1 transition)
+        def touchdown(c: Array) -> Array:
+            prev = jnp.concatenate([jnp.array([False]), c[:-1]])
+            return jnp.logical_and(c, jnp.logical_not(prev))
+
+        td_l = touchdown(left_contact)
+        td_r = touchdown(right_contact)
+
+        left_air_shifted = jnp.roll(left_air, 1)
+        right_air_shifted = jnp.roll(right_air, 1)
+
+        left_feet_airtime_reward = (left_air_shifted - self.touchdown_penalty) * td_l.astype(jnp.float32)
+        right_feet_airtime_reward = (right_air_shifted - self.touchdown_penalty) * td_r.astype(jnp.float32)
+
+        reward = left_feet_airtime_reward + right_feet_airtime_reward
+
+        # standing mask
+        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
+        reward = jnp.where(is_zero_cmd, 0.0, reward)
+
+        return reward, reward_carry
 
 @attrs.define(frozen=True, kw_only=True)
 class JointPositionPenalty(ksim.JointDeviationPenalty):
@@ -93,6 +555,252 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+@attrs.define(frozen=True, kw_only=True)
+class StraightLegPenalty(JointPositionPenalty):
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -1.0,
+        scale_by_curriculum: bool = False,
+    ) -> Self:
+        return cls.create_from_names(
+            names=[
+                "left_hip_roll",
+                "left_hip_yaw",
+                "right_hip_roll",
+                "right_hip_yaw",
+            ],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+
+
+class AnkleKneePenalty(JointPositionPenalty):
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -1.0,
+        scale_by_curriculum: bool = False,
+    ) -> Self:
+        return cls.create_from_names(
+            names=["left_knee_pitch", "left_ankle_pitch", "right_knee_pitch", "right_ankle_pitch"],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+
+@attrs.define(frozen=True, kw_only=True)
+class ArmPosePenalty(JointPositionPenalty):
+    """Keeps the arm joints near the reference pose in ZEROS."""
+
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -0.05,          # tune to taste (-ve = penalty)
+        scale_by_curriculum: bool = True,
+    ) -> "ArmPosePenalty":
+        return cls.create_from_names(
+            names=[
+                # left arm
+                "left_shoulder_pitch",
+                "left_shoulder_roll",
+                "left_elbow_roll",
+                "left_gripper_roll",
+                # right arm
+                "right_shoulder_pitch",
+                "right_shoulder_roll",
+                "right_elbow_roll",
+                "right_gripper_roll",
+            ],
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+        
+
+@attrs.define(frozen=True)
+class FeetOrientationReward(ksim.Reward):
+    """Reward for keeping feet pitch and roll oriented parallel to the ground."""
+
+    scale: float = attrs.field(default=1.0)
+    error_scale: float = attrs.field(default=0.25)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        left_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 23, :])
+        right_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 18, :])
+
+        straight_foot_euler = jnp.stack([-jnp.pi / 2, 0], axis=-1)  # ignore yaw
+
+        left_error = jnp.abs(left_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
+        right_error = jnp.abs(right_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
+
+        total_error = left_error + right_error
+        return jnp.exp(-total_error / self.error_scale)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class SimpleSingleFootContactReward(ksim.Reward):
+    """Reward having one and only one foot in contact with the ground, while walking."""
+
+    scale: float = 1.0
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
+        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
+        single = jnp.logical_xor(left_contact, right_contact).squeeze()
+
+        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
+        reward = jnp.where(is_zero_cmd, 1.0, single)
+        return reward
+
+
+@attrs.define(frozen=True, kw_only=True)
+class ContactForcePenalty(ksim.Reward):
+    """Penalises vertical forces above threshold."""
+
+    scale: float = -1.0
+    max_contact_force: float = 350.0
+    sensor_names: tuple[str, ...]
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        forces = jnp.stack([traj.obs[n] for n in self.sensor_names], axis=-1)
+        cost = jnp.clip(jnp.abs(forces[:, 2, :]) - self.max_contact_force, 0)
+        return jnp.sum(cost, axis=-1)
+
+
+def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
+    """Rotates one quaternion by another quaternion through quaternion multiplication.
+
+    This performs the operation: rotating_quat * quat_to_rotate * rotating_quat^(-1) if inverse=False
+    or rotating_quat^(-1) * quat_to_rotate * rotating_quat if inverse=True
+
+    Args:
+        quat_to_rotate: The quaternion being rotated (w,x,y,z), shape (*, 4)
+        rotating_quat: The quaternion performing the rotation (w,x,y,z), shape (*, 4)
+        inverse: If True, rotate by the inverse of rotating_quat
+        eps: Small epsilon value to avoid division by zero in normalization
+
+    Returns:
+        The rotated quaternion (w,x,y,z), shape (*, 4)
+    """
+    # Normalize both quaternions
+    quat_to_rotate = quat_to_rotate / (jnp.linalg.norm(quat_to_rotate, axis=-1, keepdims=True) + eps)
+    rotating_quat = rotating_quat / (jnp.linalg.norm(rotating_quat, axis=-1, keepdims=True) + eps)
+
+    # If inverse requested, conjugate the rotating quaternion (negate x,y,z components)
+    if inverse:
+        rotating_quat = rotating_quat.at[..., 1:].multiply(-1)
+
+    # Extract components of both quaternions
+    w1, x1, y1, z1 = jnp.split(rotating_quat, 4, axis=-1)  # rotating quaternion
+    w2, x2, y2, z2 = jnp.split(quat_to_rotate, 4, axis=-1)  # quaternion being rotated
+
+    # Quaternion multiplication formula
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    result = jnp.concatenate([w, x, y, z], axis=-1)
+
+    # Normalize result
+    return result / (jnp.linalg.norm(result, axis=-1, keepdims=True) + eps)
+
+@attrs.define(frozen=True, kw_only=True)
+class ImuOrientationObservation(ksim.StatefulObservation):
+    """Observes the IMU orientation, back spun in yaw heading, as commanded.
+
+    This provides an approximation of reading the IMU orientation from
+    the IMU on the physical robot, backspun by commanded heading. The `framequat_name` should be the name of
+    the framequat sensor attached to the IMU.
+
+    Example: if yaw cmd = 3.14, and IMU reading is [0, 0, 0, 1], then back spun IMU heading obs is [1, 0, 0, 0]
+
+    The policy learns to keep the IMU heading obs around [1, 0, 0, 0].
+    """
+
+    framequat_idx_range: tuple[int, int | None] = attrs.field()
+    lag_range: tuple[float, float] = attrs.field(
+        default=(0.01, 0.1),
+        validator=attrs.validators.deep_iterable(
+            attrs.validators.and_(
+                attrs.validators.ge(0.0),
+                attrs.validators.lt(1.0),
+            ),
+        ),
+    )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        physics_model: ksim.PhysicsModel,
+        framequat_name: str,
+        lag_range: tuple[float, float] = (0.01, 0.1),
+        noise: float = 0.0,
+    ) -> Self:
+        """Create a IMU orientation observation from a physics model.
+
+        Args:
+            physics_model: MuJoCo physics model
+            framequat_name: The name of the framequat sensor
+            lag_range: The range of EMA factors to use, to approximate the
+                variation in the amount of smoothing of the Kalman filter.
+            noise: The observation noise
+        """
+        sensor_name_to_idx_range = ksim.get_sensor_data_idxs_by_name(physics_model)
+        if framequat_name not in sensor_name_to_idx_range:
+            options = "\n".join(sorted(sensor_name_to_idx_range.keys()))
+            raise ValueError(f"{framequat_name} not found in model. Available:\n{options}")
+
+        return cls(
+            framequat_idx_range=sensor_name_to_idx_range[framequat_name],
+            lag_range=lag_range,
+            noise=noise,
+        )
+
+    def initial_carry(self, physics_state: ksim.PhysicsState, rng: PRNGKeyArray) -> tuple[Array, Array]:
+        minval, maxval = self.lag_range
+        return jnp.zeros((4,)), jax.random.uniform(rng, (1,), minval=minval, maxval=maxval)
+
+    def observe_stateful(
+        self,
+        state: ksim.ObservationInput,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> tuple[Array, tuple[Array, Array]]:
+        framequat_start, framequat_end = self.framequat_idx_range
+        framequat_data = state.physics_state.data.sensordata[framequat_start:framequat_end].ravel()
+
+        # Add noise
+        # # BUG? noise is added twice? also in ksim rl.py
+        # framequat_data = add_noise(framequat_data, rng, "gaussian", self.noise, curriculum_level)
+
+        # get heading cmd
+        heading_yaw_cmd = state.commands[COMMAND_NAME][3]
+
+        # spin back
+        heading_yaw_cmd_quat = xax.euler_to_quat(jnp.array([0.0, 0.0, heading_yaw_cmd]))
+        backspun_framequat = rotate_quat_by_quat(framequat_data, heading_yaw_cmd_quat, inverse=True)
+        # ensure positive quat hemisphere
+        backspun_framequat = jnp.where(backspun_framequat[..., 0] < 0, -backspun_framequat, backspun_framequat)
+
+        # Get current Kalman filter state
+        x, lag = state.obs_carry
+        x = x * lag + backspun_framequat * (1 - lag)
+
+        return x, (x, lag)
+
+@attrs.define(frozen=True)
+class BaseHeightObservation(ksim.Observation):
+    """Single-scalar z of body-1 (the robot base)."""
+    def observe(self, state: ksim.ObservationInput, curriculum_level, rng):
+        # body 0 is world; body 1 is the floating base
+        return state.physics_state.data.xpos[1, 2:]
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -172,8 +880,7 @@ class Actor(eqx.Module):
         # Softplus and clip to ensure positive standard deviations.
         std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
 
-        # Comment out because we now sample deltas not absolute positions
-        # mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
+        mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
 
         dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
 
@@ -654,22 +1361,22 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
-            #    ksim.PushEvent(
-            #        x_linvel=0.1,
-            #        y_linvel=0.1,
-            #        z_linvel=0.05,
-            #        x_angvel=0.0,  # angular velocity in rad/s
-            #        y_angvel=0.0,
-            #        z_angvel=0.0,
-            #        vel_range=(0.05, 0.15),
-            #        interval_range=(2.0, 4.0)
-            #    ),
+               ksim.PushEvent(
+                   x_linvel=0.1,
+                   y_linvel=0.1,
+                   z_linvel=0.05,
+                   x_angvel=0.0,  # angular velocity in rad/s
+                   y_angvel=0.0,
+                   z_angvel=0.0,
+                   vel_range=(0.05, 0.15),
+                   interval_range=(2.0, 4.0)
+               ),
         ]
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
-            # ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
-            # ksim.RandomJointVelocityReset(),
+            ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.0),
+            ksim.RandomJointVelocityReset(),
             # ksim.RandomHeadingReset(),
         ]
 
@@ -681,24 +1388,20 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             FeetechTorqueObservation(),
             ksim.CenterOfMassInertiaObservation(),
             ksim.CenterOfMassVelocityObservation(),
+            BaseHeightObservation(),
             ksim.BasePositionObservation(),
             ksim.BaseOrientationObservation(),
             ksim.BaseLinearVelocityObservation(),
             ksim.BaseAngularVelocityObservation(),
             ksim.BaseLinearAccelerationObservation(),
             ksim.BaseAngularAccelerationObservation(),
-            ksim.ProjectedGravityObservation.create(
+            ImuOrientationObservation.create(
                 physics_model=physics_model,
                 framequat_name="imu_site_quat",
-                lag_range=(0.0, 0.05),
+                lag_range=(0.0, 0.1),
                 noise=math.radians(1),
             ),
             ksim.ActuatorAccelerationObservation(),
-            ksim.BasePositionObservation(),
-            ksim.BaseOrientationObservation(),
-            ksim.BaseLinearVelocityObservation(),
-            ksim.BaseAngularVelocityObservation(),
-            ksim.CenterOfMassVelocityObservation(),
             ksim.SensorObservation.create(
                 physics_model=physics_model,
                 sensor_name="imu_acc",
@@ -710,6 +1413,21 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 noise=math.radians(0),
             ),
         ]
+        # get_observations
+        obs_list += [
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch",  noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_force",  noise=0.0),
+            ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_force", noise=0.0),
+            FeetPositionObservation.create(
+                physics_model=physics_model,
+                foot_left_site_name="left_foot",
+                foot_right_site_name="right_foot",
+                floor_threshold=0.0,
+                in_robot_frame=True,
+            )
+        ]
+
 
         # Add action-position observation for each joint
         obs_list.extend(
@@ -725,41 +1443,82 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return obs_list
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
+        fwd_speed = 2.0          # m/s – choose whatever "max" you want
+
         return [
-            ksim.JoystickCommand(
-                sample_probs=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),  # Always "stand still" during training
-            ),
+            # UnifiedCommand(
+            #     vx_range=(-0.1, 0.3),  # m/s
+            #     vy_range=(-0.075, 0.075),  # m/s
+            #     wz_range=(-0.5, 0.5),  # rad/s
+            #     # bh_range=(-0.05, 0.05), # m
+            #     bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
+            #     bh_standing_range=(0.0, 0.0), # m
+            #     # bh_standing_range=(0.0, 0.0),  # m
+            #     rx_range=(-0.0, 0.0),  # rad
+            #     ry_range=(-0.0, 0.0),  # rad
+            #     ctrl_dt=self.config.ctrl_dt,
+            #     switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
+            # ),
+            
+            ConstantForwardCommand(
+                vx=fwd_speed,
+                ctrl_dt=self.config.ctrl_dt,
+            )
         ]
 
-    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
+    def get_rewards(self, physics_model):
         return [
             ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=1.0),
-            # ksim.AngularVelocityPenalty(index=("x", "y", "z"), scale=-0.005,scale_by_curriculum=True),
-            # ksim.LinearVelocityPenalty(index=("x", "y", "z"), scale=-0.005,scale_by_curriculum=True),
-            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            # ksim.ReachabilityPenalty(
-            #     delta_max_j=tuple(float(x) for x in self.delta_max_j),
-            #     scale=-1.0,
-            #     squared=True,
-            #     scale_by_curriculum=True,
+            # ksim.NaiveForwardReward(scale=1.0),
+
+            # --- command-tracking ---
+            L1LinearVelocityTrackingReward(scale=1.0),
+            # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
+            # XYOrientationReward(scale=0.2,          error_scale=0.03),
+            # BaseHeightReward(scale=0.1,             error_scale=0.05,
+            #                 standard_height=0.27),          # adjust if COM is lower
+
+            # SimpleSingleFootContactReward(scale=0.3),
+
+            # keep the old posture prior (optional)
+            # JointPositionPenalty.create_from_names(
+            #     physics_model=physics_model,
+            #     names=[name for name, _ in ZEROS],
+            #     scale=-0.1,
             # ),
-            JointPositionPenalty.create_from_names(
-                physics_model=physics_model,
-                names=[name for name, _ in ZEROS],
-                scale=-0.1,
+            FeetAirtimeReward(
+                scale=2.5,
+                ctrl_dt=self.config.ctrl_dt,
+                touchdown_penalty=0.3,
             ),
+            FeetOrientationReward(scale=0.1, error_scale=0.25),
+            StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
+            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
+            #     scale=-0.03,
+            #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
+            # ),
+            ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
         return [
             ksim.BadZTermination(unhealthy_z_lower=0.05, unhealthy_z_upper=0.5),
+            ksim.NotUprightTermination(max_radians=math.radians(60)),
+            ksim.EpisodeLengthTermination(max_length_sec=80),
         ]
 
-    def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
-        return ksim.LinearCurriculum(
-            step_size=0.0,
-            step_every_n_epochs=10,
+    def get_curriculum(self, physics_model):
+        return ksim.EpisodeLengthCurriculum(
+            num_levels=30,
+            increase_threshold=30.0,
+            decrease_threshold=10.0,
+            min_level_steps=10,
+            min_level=0.5,
         )
 
     def get_model(self, key: PRNGKeyArray) -> Model:
@@ -784,22 +1543,17 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     ) -> tuple[distrax.Distribution, Array]:
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
-        proj_grav_3 = observations["projected_gravity_observation"]
-
-        def maybe_drop(x: Array, p: float, key: PRNGKeyArray) -> Array:
-            mask = jax.random.bernoulli(key, p, x.shape)
-            return jnp.where(mask, 0.0, x)
-
-        # Occasionally zeroing the gravity vector forces the policy to back‑up
-        # on joint encoders / base‑quat and stops it from keying on one cue
-        rng, sub = jax.random.split(rng)
-        proj_grav_3 = maybe_drop(proj_grav_3, p=0.0, key=sub)  # don't drop for now
+        imu_quat_4 = observations["imu_orientation_observation"]
+        cmd = commands[COMMAND_NAME]          # shape (...,7)
 
         obs_n = jnp.concatenate(
             [
                 joint_pos_n,  # NUM_JOINTS
                 joint_vel_n,  # NUM_JOINTS
-                proj_grav_3,  # 3
+                imu_quat_4,   # 4
+                cmd[..., :2],      # vx, vy
+                cmd[..., 3:4],     # heading   (index 3)
+                cmd[..., 4:],      # bh, rx, ry
             ],
             axis=-1,
         )
@@ -821,7 +1575,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         com_vel_n = observations["center_of_mass_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        proj_grav_3 = observations["projected_gravity_observation"]
+        imu_quat_4 = observations["imu_orientation_observation"]
+        cmd_7       = commands[COMMAND_NAME]  # still 7 elements for critic
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
@@ -834,7 +1589,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 com_vel_n,  # 96
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
-                proj_grav_3,  # 3
+                imu_quat_4,  # 4
+                cmd_7,  # 7
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
@@ -934,6 +1690,7 @@ if __name__ == "__main__":
             # Training parameters.
             num_envs=2048,
             batch_size=256,
+            learning_rate=1e-3,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
@@ -946,6 +1703,6 @@ if __name__ == "__main__":
             save_every_n_seconds=60,
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
-            valid_first_n_steps=1,
+            # valid_first_n_steps=1,
         ),
     )
