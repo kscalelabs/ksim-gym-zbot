@@ -338,25 +338,23 @@ class L1LinearVelocityTrackingReward(ksim.Reward):
             raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
 
         # -----------------------------------------------------------------------
-        # 1.  Global-frame velocities (same as before)
+        # 1. Command in the ROBOT frame (unchanged)
         global_vel = trajectory.obs[self.linvel_obs_name]
-
-        base_euler   = xax.quat_to_euler(trajectory.xquat[:, 1, :])
-        base_euler   = base_euler.at[:, :2].set(0.0)          # keep only yaw
-        base_z_quat  = xax.euler_to_quat(base_euler)
-
-        robot_vel_cmd  = jnp.zeros_like(global_vel).at[:, :2].set(
-            trajectory.command[self.command_name][:, :2]
+        robot_vel_cmd = jnp.zeros_like(global_vel).at[:, :2].set(
+            trajectory.command[self.command_name][:, :2]        # [vx_cmd, vy_cmd]
         )
-        
-        global_vel_cmd = xax.rotate_vector_by_quat(robot_vel_cmd, base_z_quat, inverse=False)
-
-        global_vel_xy      = global_vel[:, :2]
-        global_vel_xy_cmd  = global_vel_cmd[:, :2]
 
         # -----------------------------------------------------------------------
-        # 2.  Linear "cone" reward with target bonus and non-negative clipping
-        diff_xy = global_vel_xy - global_vel_xy_cmd
+        # 2. Rotate the *measured* velocity into the robot frame
+        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler = base_euler.at[:, :2].set(0.0)          # keep only yaw
+        base_z_quat = xax.euler_to_quat(base_euler)
+        vel_robot = xax.rotate_vector_by_quat(global_vel, base_z_quat, inverse=True)
+        vel_robot_xy = vel_robot[:, :2]                       # keep XY only
+
+        # -----------------------------------------------------------------------
+        # 3. L1 error in robot coordinates
+        diff_xy = vel_robot_xy - robot_vel_cmd[:, :2]
         error = jnp.sum(xax.get_norm(diff_xy, "l1"), axis=-1)
 
         # A.  Standing still kernel (optional – same trick you had)
@@ -368,7 +366,7 @@ class L1LinearVelocityTrackingReward(ksim.Reward):
         # Reward is target_bonus - slope*error for walking, target_bonus - slope*vel for stand-still
         # (negative sign because RL maximises reward)
         walk_reward = self.target_bonus - self.slope * error
-        stand_reward = self.target_bonus - self.slope * jnp.sum(xax.get_norm(global_vel_xy, "l1"), axis=-1)
+        stand_reward = self.target_bonus - self.slope * jnp.sum(xax.get_norm(vel_robot_xy, "l1"), axis=-1)
 
         # # Clip rewards to be non-negative
         # walk_reward = jnp.maximum(0.0, walk_reward)
