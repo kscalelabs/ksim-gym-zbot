@@ -326,11 +326,12 @@ class LinearVelocityTrackingReward(ksim.Reward):
 class L1LinearVelocityTrackingReward(ksim.Reward):
     """Reward that grows *linearly* as the XY speed approaches the command."""
 
-    # --- you can re-use the old fields, but error_scale now means “slope” --------
+    # --- you can re-use the old fields, but error_scale now means "slope" --------
     slope: float = attrs.field(default=1.0)          # 1.0 → reward rises 1 unit per 1 m/s of error reduction
     linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
     command_name: str = attrs.field(default=COMMAND_NAME)
     stand_still_threshold: float = attrs.field(default=1e-2)
+    target_bonus: float = attrs.field(default=2.0)    # Bonus for perfect tracking
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         if self.linvel_obs_name not in trajectory.obs:
@@ -354,8 +355,9 @@ class L1LinearVelocityTrackingReward(ksim.Reward):
         global_vel_xy_cmd  = global_vel_cmd[:, :2]
 
         # -----------------------------------------------------------------------
-        # 2.  Linear “cone” reward  (–‖error‖  →  maximise ⇒ minimise error)
-        vel_error = jnp.linalg.norm(global_vel_xy - global_vel_xy_cmd, axis=-1)
+        # 2.  Linear "cone" reward with target bonus and non-negative clipping
+        diff_xy = global_vel_xy - global_vel_xy_cmd
+        error = jnp.sum(xax.get_norm(diff_xy, "l1"), axis=-1)
 
         # A.  Standing still kernel (optional – same trick you had)
         zero_cmd_mask = (
@@ -363,10 +365,14 @@ class L1LinearVelocityTrackingReward(ksim.Reward):
             < self.stand_still_threshold
         )
 
-        # Reward is –‖error‖ for walking,  –‖vel‖ for stand-still
+        # Reward is target_bonus - slope*error for walking, target_bonus - slope*vel for stand-still
         # (negative sign because RL maximises reward)
-        walk_reward  = -self.slope * vel_error
-        stand_reward = -self.slope * jnp.linalg.norm(global_vel_xy, axis=-1)
+        walk_reward = self.target_bonus - self.slope * error
+        stand_reward = self.target_bonus - self.slope * jnp.sum(xax.get_norm(global_vel_xy, "l1"), axis=-1)
+
+        # # Clip rewards to be non-negative
+        # walk_reward = jnp.maximum(0.0, walk_reward)
+        # stand_reward = jnp.maximum(0.0, stand_reward)
 
         return jnp.where(zero_cmd_mask, stand_reward, walk_reward)
 
@@ -1439,7 +1445,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return obs_list
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        fwd_speed = 2.0          # m/s – choose whatever “max” you want
+        fwd_speed = 2.0          # m/s – choose whatever "max" you want
 
         return [
             # UnifiedCommand(
