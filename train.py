@@ -60,11 +60,11 @@ ZEROS: list[tuple[str, float]] = [
     ("left_ankle_roll", 0.0),
     ("left_shoulder_pitch", 0.0),
     ("left_shoulder_roll", 0.2),
-    ("left_elbow_roll", 0.2),
+    ("left_elbow_roll", -0.2),
     ("left_gripper_roll", 0.0),
     ("right_shoulder_pitch", 0.0),
     ("right_shoulder_roll", -0.2),
-    ("right_elbow_roll", -0.2),
+    ("right_elbow_roll", 0.2),
     ("right_gripper_roll", 0.0),
 ]
 
