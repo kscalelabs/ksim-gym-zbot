@@ -638,24 +638,50 @@ class ArmPosePenalty(JointPositionPenalty):
         )
         
 
-@attrs.define(frozen=True)
+@attrs.define(frozen=True, kw_only=True)
 class FeetOrientationReward(ksim.Reward):
-    """Reward for keeping feet pitch and roll oriented parallel to the ground."""
+    """Encourage both feet to stay level"""
 
-    scale: float = attrs.field(default=1.0)
-    error_scale: float = attrs.field(default=0.25)
+    left_idx:  int                      # resolved once during .create()
+    right_idx: int
+    target_rp: tuple[float, float] = (0.0, 0.0)     # (roll_tgt, pitch_tgt) in *radians*
+    error_scale: float = 0.25           # fall-off (rad); smaller ⇒ sharper penalty
+    scale:       float = 1.0            # weight in the total reward
 
-    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
-        left_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 23, :])
-        right_foot_euler = xax.quat_to_euler(trajectory.xquat[:, 18, :])
+    @classmethod
+    def create(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        *,
+        left_name: str  = "Left_Foot",
+        right_name: str = "Right_Foot",
+        target_rp: tuple[float, float] = (0.0, 0.0),        # Z-Bot flat pose
+        error_scale: float = 0.25,
+        scale: float = 0.1,
+    ) -> Self:
+        """Resolve body indices and build the reward instance."""
+        left_id  = ksim.get_body_data_idx_from_name(physics_model, left_name)
+        right_id = ksim.get_body_data_idx_from_name(physics_model, right_name)
+        return cls(
+            left_idx   = left_id,
+            right_idx  = right_id,
+            target_rp  = target_rp,
+            error_scale= error_scale,
+            scale      = scale,
+        )
 
-        straight_foot_euler = jnp.stack([-jnp.pi / 2, 0], axis=-1)  # ignore yaw
+    def get_reward(self, traj: ksim.Trajectory) -> jnp.ndarray:
+        # 1) quats → euler, keep roll & pitch only
+        left_rp  = xax.quat_to_euler(traj.xquat[:, self.left_idx , :])[:, :2]
+        right_rp = xax.quat_to_euler(traj.xquat[:, self.right_idx, :])[:, :2]
 
-        left_error = jnp.abs(left_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
-        right_error = jnp.abs(right_foot_euler[:, :2] - straight_foot_euler).sum(axis=-1)
+        # 2) absolute |error| against the (roll_tgt, pitch_tgt)
+        tgt = jnp.array(self.target_rp)
+        err = jnp.abs(left_rp - tgt).sum(axis=-1) + jnp.abs(right_rp - tgt).sum(axis=-1)
 
-        total_error = left_error + right_error
-        return jnp.exp(-total_error / self.error_scale)
+        # 3) smooth exponential kernel, then ksim multiplies by self.scale
+        return jnp.exp(-err / self.error_scale)
+
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -1488,8 +1514,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return [
             ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=1.0),
-            ksim.NaiveForwardReward(scale=1.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
+            ksim.NaiveForwardReward(scale=5.0, clip_min=None, clip_max=0.2),
+            ksim.NaiveForwardOrientationReward(scale=0.3),
 
             # --- command-tracking ---
             # LinearVelocityTrackingReward(scale=5.0,  error_scale=0.87),
@@ -1511,7 +1537,12 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 ctrl_dt=self.config.ctrl_dt,
                 touchdown_penalty=0.3,
             ),
-            FeetOrientationReward(scale=0.1, error_scale=0.25),
+            FeetOrientationReward.create(
+                physics_model,
+                target_rp=(0.0, 0.0),
+                error_scale=0.25,
+                scale=0.3,
+            ),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
