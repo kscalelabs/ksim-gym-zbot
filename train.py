@@ -32,7 +32,7 @@ NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS           # 50
 # Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
 NUM_CRITIC_INPUTS = 484   # 340
 
-COMMAND_NAME = "forward_only_command"
+COMMAND_NAME = "zero_command"
 
 def get_servo_deadband() -> tuple[float, float]:
     """Get deadband values based on current servo configuration."""
@@ -281,6 +281,22 @@ class ConstantForwardCommand(ksim.Command):
     def __call__(self, prev_command, physics_data, *_) -> Array:
         heading = self._current_heading(physics_data)
         return prev_command.at[3].set(heading)
+
+
+@attrs.define(frozen=True)
+class ConstantZeroCommand(ksim.Command):
+    ctrl_dt: float
+
+    def get_name(self) -> str:
+        return COMMAND_NAME
+
+    def initial_command(self, physics_data, *_) -> Array:
+        # Return all zeros: [vx=0, vy=0, wz=0, heading=0, bh=0, rx=0, ry=0]
+        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    def __call__(self, prev_command, physics_data, *_) -> Array:
+        # Always return all zeros
+        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -1443,8 +1459,6 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return obs_list
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        fwd_speed = 2.0          # m/s – choose whatever "max" you want
-
         return [
             # UnifiedCommand(
             #     vx_range=(-0.1, 0.3),  # m/s
@@ -1460,8 +1474,12 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
             # ),
             
-            ConstantForwardCommand(
-                vx=fwd_speed,
+            # ConstantForwardCommand(
+            #     vx=fwd_speed,
+            #     ctrl_dt=self.config.ctrl_dt,
+            # )
+            
+            ConstantZeroCommand(
                 ctrl_dt=self.config.ctrl_dt,
             )
         ]
@@ -1470,10 +1488,11 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return [
             ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=1.0),
-            # ksim.NaiveForwardReward(scale=1.0),
+            ksim.NaiveForwardReward(scale=1.0),
+            ksim.NaiveForwardOrientationReward(scale=1.0),
 
             # --- command-tracking ---
-            L1LinearVelocityTrackingReward(scale=1.0),
+            # LinearVelocityTrackingReward(scale=5.0,  error_scale=0.87),
             # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
             # XYOrientationReward(scale=0.2,          error_scale=0.03),
             # BaseHeightReward(scale=0.1,             error_scale=0.05,
@@ -1502,7 +1521,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     scale=-0.03,
             #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
             # ),
-            ArmPosePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            ArmPosePenalty.create_penalty(physics_model, scale=-5.00, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
