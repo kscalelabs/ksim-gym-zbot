@@ -27,20 +27,11 @@ logger = logging.getLogger(__name__)
 NUM_JOINTS = 20
 NUM_COMMANDS = 6
 NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS  # 50
-# Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
+# Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc
+# + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
 NUM_CRITIC_INPUTS = 484  # 340
 
 COMMAND_NAME = "zero_command"
-
-
-def get_servo_deadband() -> tuple[float, float]:
-    """Get deadband values based on current servo configuration."""
-    encoder_resolution = 0.087 * jnp.pi / 180  # radians
-
-    pos_deadband = 2 * encoder_resolution
-    neg_deadband = 2 * encoder_resolution
-
-    return pos_deadband, neg_deadband
 
 
 # These are in the order of the neural network outputs.
@@ -69,12 +60,7 @@ JOINT_BIASES: list[tuple[str, float, float]] = [
 ]
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class PlannerState:
-    position: Array
-    velocity: Array
-    last_computed_torque: Array
+# Joystick Components, unused at the moment.
 
 
 @attrs.define(kw_only=True)
@@ -266,43 +252,6 @@ class UnifiedCommand(ksim.Command):
         ]
 
 
-@attrs.define(frozen=True)
-class ConstantForwardCommand(ksim.Command):
-    vx: float
-    ctrl_dt: float
-
-    def get_name(self) -> str:
-        return COMMAND_NAME
-
-    @staticmethod
-    def _current_heading(physics_data: PhysicsData) -> Array:
-        return xax.quat_to_euler(physics_data.xquat[1])[2]
-
-    def initial_command(self, physics_data, *_) -> Array:
-        heading = self._current_heading(physics_data)
-        return jnp.array([self.vx, 0.0, 0.0, heading, 0.0, 0.0, 0.0])
-
-    def __call__(self, prev_command, physics_data, *_) -> Array:
-        heading = self._current_heading(physics_data)
-        return prev_command.at[3].set(heading)
-
-
-@attrs.define(frozen=True)
-class ConstantZeroCommand(ksim.Command):
-    ctrl_dt: float
-
-    def get_name(self) -> str:
-        return COMMAND_NAME
-
-    def initial_command(self, physics_data, *_) -> Array:
-        # Return all zeros: [vx=0, vy=0, wz=0, heading=0, bh=0, rx=0, ry=0]
-        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-    def __call__(self, prev_command, physics_data, *_) -> Array:
-        # Always return all zeros
-        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-
 @attrs.define(frozen=True, kw_only=True)
 class LinearVelocityTrackingReward(ksim.Reward):
     """Reward for tracking the linear velocity."""
@@ -441,6 +390,23 @@ class XYOrientationReward(ksim.Reward):
 
         quat_error = 1 - jnp.sum(base_xy_quat_cmd * base_xy_quat, axis=-1) ** 2
         return jnp.exp(-quat_error / self.error_scale)
+
+
+# Constant Zero Command, currently to match command dims from joystick.
+@attrs.define(frozen=True)
+class ConstantZeroCommand(ksim.Command):
+    ctrl_dt: float
+
+    def get_name(self) -> str:
+        return COMMAND_NAME
+
+    def initial_command(self, physics_data, *_) -> Array:
+        # Return all zeros: [vx=0, vy=0, wz=0, heading=0, bh=0, rx=0, ry=0]
+        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    def __call__(self, prev_command, physics_data, *_) -> Array:
+        # Always return all zeros
+        return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 @attrs.define(frozen=True)
@@ -661,13 +627,13 @@ class ArmPosePenalty(JointPositionPenalty):
 
 @attrs.define(frozen=True, kw_only=True)
 class FeetOrientationReward(ksim.Reward):
-    """Encourage both feet to stay level"""
+    """Encourage both feet to stay level."""
 
-    left_idx: int  # resolved once during .create()
+    left_idx: int
     right_idx: int
-    target_rp: tuple[float, float] = (0.0, 0.0)  # (roll_tgt, pitch_tgt) in *radians*
-    error_scale: float = 0.25  # fall-off (rad); smaller ⇒ sharper penalty
-    scale: float = 1.0  # weight in the total reward
+    target_rp: tuple[float, float] = (0.0, 0.0)
+    error_scale: float = 0.25
+    scale: float = 1.0
 
     @classmethod
     def create(
@@ -676,7 +642,7 @@ class FeetOrientationReward(ksim.Reward):
         *,
         left_name: str = "Left_Foot",
         right_name: str = "Right_Foot",
-        target_rp: tuple[float, float] = (0.0, 0.0),  # Z-Bot flat pose
+        target_rp: tuple[float, float] = (0.0, 0.0),
         error_scale: float = 0.25,
         scale: float = 0.1,
     ) -> Self:
@@ -696,11 +662,10 @@ class FeetOrientationReward(ksim.Reward):
         left_rp = xax.quat_to_euler(traj.xquat[:, self.left_idx, :])[:, :2]
         right_rp = xax.quat_to_euler(traj.xquat[:, self.right_idx, :])[:, :2]
 
-        # 2) absolute |error| against the (roll_tgt, pitch_tgt)
+        # 2) absolute error against the target roll and pitch
         tgt = jnp.array(self.target_rp)
         err = jnp.abs(left_rp - tgt).sum(axis=-1) + jnp.abs(right_rp - tgt).sum(axis=-1)
 
-        # 3) smooth exponential kernel, then ksim multiplies by self.scale
         return jnp.exp(-err / self.error_scale)
 
 
@@ -1086,6 +1051,24 @@ class ZbotWalkingTaskConfig(ksim.PPOConfig):
     )
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class PlannerState:
+    position: Array
+    velocity: Array
+    last_computed_torque: Array
+
+
+def get_servo_deadband() -> tuple[float, float]:
+    """Get deadband values based on current servo configuration."""
+    encoder_resolution = 0.087 * jnp.pi / 180  # radians
+
+    pos_deadband = 2 * encoder_resolution
+    neg_deadband = 2 * encoder_resolution
+
+    return pos_deadband, neg_deadband
+
+
 class FeetechParams(TypedDict):
     sysid: str
     max_torque: float
@@ -1385,9 +1368,6 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         delta_max = jnp.array(vmax) * self.config.ctrl_dt + 0.5 * jnp.array(amax) * self.config.ctrl_dt**2
         self.delta_max_j = delta_max
 
-        # ------------------------------------------------------------------
-        # 4. Instantiate controller (lists → jnp.array on‑the‑fly)
-        # ------------------------------------------------------------------
         return FeetechActuators(
             max_torque_j=jnp.array(max_torque),
             kp_j=jnp.array(kp),
@@ -1434,7 +1414,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 x_linvel=0.1,
                 y_linvel=0.1,
                 z_linvel=0.05,
-                x_angvel=0.0,  # angular velocity in rad/s
+                x_angvel=0.0,
                 y_angvel=0.0,
                 z_angvel=0.0,
                 vel_range=(0.05, 0.15),
@@ -1446,7 +1426,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return [
             ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v, _ in JOINT_BIASES}, scale=0.0),
             ksim.RandomJointVelocityReset(),
-            # ksim.RandomHeadingReset(),
+            # ksim.RandomHeadingReset(), # because only naive forward reward is used at the moment
         ]
 
     def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
@@ -1512,23 +1492,6 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
         return [
-            # UnifiedCommand(
-            #     vx_range=(-0.1, 0.3),  # m/s
-            #     vy_range=(-0.075, 0.075),  # m/s
-            #     wz_range=(-0.5, 0.5),  # rad/s
-            #     # bh_range=(-0.05, 0.05), # m
-            #     bh_range=(0.0, 0.0),  # m # disabled for now, does not work on this robot. reward conflicts
-            #     bh_standing_range=(0.0, 0.0), # m
-            #     # bh_standing_range=(0.0, 0.0),  # m
-            #     rx_range=(-0.0, 0.0),  # rad
-            #     ry_range=(-0.0, 0.0),  # rad
-            #     ctrl_dt=self.config.ctrl_dt,
-            #     switch_prob=self.config.ctrl_dt / 4,  # once per x seconds
-            # ),
-            # ConstantForwardCommand(
-            #     vx=fwd_speed,
-            #     ctrl_dt=self.config.ctrl_dt,
-            # )
             ConstantZeroCommand(
                 ctrl_dt=self.config.ctrl_dt,
             )
@@ -1541,24 +1504,12 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.NaiveForwardReward(scale=5.0, clip_min=None, clip_max=0.2),
             ksim.NaiveForwardOrientationReward(scale=0.3),
             ksim.LinearVelocityPenalty(
-                index="y",  # penalise the Y component only
-                in_robot_frame=True,  # Y is “sideways” relative to the robot’s own heading
-                norm="l1",  # |vy|
-                scale=-2.0,  # make the cost big enough to matter
+                index="y",
+                in_robot_frame=True,
+                norm="l1",
+                scale=-2.0,
             ),
-            # --- command-tracking ---
-            # LinearVelocityTrackingReward(scale=5.0,  error_scale=0.87),
-            # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
-            # XYOrientationReward(scale=0.2,          error_scale=0.03),
-            # BaseHeightReward(scale=0.1,             error_scale=0.05,
-            #                 standard_height=0.27),          # adjust if COM is lower
             # SimpleSingleFootContactReward(scale=0.3),
-            # keep the old posture prior (optional)
-            # JointPositionPenalty.create_from_names(
-            #     physics_model=physics_model,
-            #     names=[name for name, _ in ZEROS],
-            #     scale=-0.1,
-            # ),
             FeetAirtimeReward(
                 scale=2.5,
                 ctrl_dt=self.config.ctrl_dt,
@@ -1745,7 +1696,6 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     ) -> ksim.Action:
         actor_carry_in, critic_carry_in = model_carry
         rng, actor_rng = jax.random.split(rng)
-        # Runs the actor model to get the action distribution.
         action_dist_j, actor_carry = self.run_actor(
             model=model.actor,
             observations=observations,
@@ -1782,6 +1732,5 @@ if __name__ == "__main__":
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
             render_azimuth=145.0,
-            # valid_first_n_steps=1,
         ),
     )
