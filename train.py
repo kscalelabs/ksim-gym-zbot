@@ -1526,6 +1526,13 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.NaiveForwardReward(scale=5.0, clip_min=None, clip_max=0.2),
             ksim.NaiveForwardOrientationReward(scale=0.3),
 
+            ksim.LinearVelocityPenalty(
+                index="y",              # penalise the Y component only
+                in_robot_frame=True,    # Y is “sideways” relative to the robot’s own heading
+                norm="l1",              # |vy|
+                scale=-2.0,             # make the cost big enough to matter
+            ),
+
             # --- command-tracking ---
             # LinearVelocityTrackingReward(scale=5.0,  error_scale=0.87),
             # AngularVelocityTrackingReward(scale=0.1, error_scale=0.005),
@@ -1562,7 +1569,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     scale=-0.03,
             #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
             # ),
-            ArmPosePenalty.create_penalty(physics_model, scale=-5.00, scale_by_curriculum=True),
+            ArmPosePenalty.create_penalty(physics_model, scale=-15.00, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1763,6 +1770,7 @@ if __name__ == "__main__":
             save_every_n_seconds=60,
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
+            render_azimuth=145.0,
             # valid_first_n_steps=1,
         ),
     )
