@@ -1275,7 +1275,10 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_mujoco_model(self) -> mujoco.MjModel:
         mjcf_path = asyncio.run(ksim.get_mujoco_model_path("zbot", name="robot"))
-        return mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
+        model = mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
+        names_to_idxs = ksim.get_geom_data_idx_by_name(model)
+        model.geom_priority[names_to_idxs["floor"]] = 2.0
+        return model
 
     def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> Metadata:
         metadata = asyncio.run(ksim.get_mujoco_model_metadata("zbot"))
@@ -1388,23 +1391,23 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
         return [
-            # ksim.StaticFrictionRandomizer(),
-            # ksim.ArmatureRandomizer(),
-            # ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.15),
-            # ksim.JointDampingRandomizer(),
-            # ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-2), scale_upper=math.radians(2)),
-            # ksim.FloorFrictionRandomizer.from_geom_name(
-            #     model=physics_model, floor_geom_name="floor", scale_lower=0.3, scale_upper=1.5
-            # ),
-            # # 1σ ≈ 1.5°, gives ~99.7% within 4.5°
-            # # enable yaw randomization with 1σ ≈ 1°
-            # # 5mm standard deviation
-            # ksim.IMUAlignmentRandomizer(
-            #     site_name="imu_site",
-            #     tilt_std_rad=math.radians(5),
-            #     yaw_std_rad=math.radians(1.0),
-            #     translate_std_m=0.005
-            # )
+            ksim.StaticFrictionRandomizer(),
+            ksim.ArmatureRandomizer(),
+            ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.15),
+            ksim.JointDampingRandomizer(),
+            ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-2), scale_upper=math.radians(2)),
+            ksim.FloorFrictionRandomizer.from_geom_name(
+                model=physics_model, floor_geom_name="floor", scale_lower=0.3, scale_upper=1.5
+            ),
+            # 1σ ≈ 1.5°, gives ~99.7% within 4.5°
+            # enable yaw randomization with 1σ ≈ 1°
+            # 5mm standard deviation
+            ksim.IMUAlignmentRandomizer(
+                site_name="imu_site",
+                tilt_std_rad=math.radians(5),
+                yaw_std_rad=math.radians(1.0),
+                translate_std_m=0.005
+            )
         ]
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
