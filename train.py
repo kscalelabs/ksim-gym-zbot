@@ -45,27 +45,28 @@ def get_servo_deadband() -> tuple[float, float]:
 
 
 # These are in the order of the neural network outputs.
-ZEROS: list[tuple[str, float]] = [
-    ("right_hip_yaw", 0.0),
-    ("right_hip_roll", 0.0),
-    ("right_hip_pitch", -0.4),
-    ("right_knee_pitch", -0.8),
-    ("right_ankle_pitch", -0.4),
-    ("right_ankle_roll", 0.0),
-    ("left_hip_yaw", 0.0),
-    ("left_hip_roll", 0.0),
-    ("left_hip_pitch", -0.4),
-    ("left_knee_pitch", -0.8),
-    ("left_ankle_pitch", -0.4),
-    ("left_ankle_roll", 0.0),
-    ("left_shoulder_pitch", 0.0),
-    ("left_shoulder_roll", 0.2),
-    ("left_elbow_roll", -0.2),
-    ("left_gripper_roll", 0.0),
-    ("right_shoulder_pitch", 0.0),
-    ("right_shoulder_roll", -0.2),
-    ("right_elbow_roll", 0.2),
-    ("right_gripper_roll", 0.0),
+# (joint_name, reference_angle_rad, weight)
+JOINT_BIASES: list[tuple[str, float, float]] = [
+    ("right_hip_yaw",        0.0,   2.0),   # 0
+    ("right_hip_roll",       0.0,   2.0),   # 1
+    ("right_hip_pitch",     -0.4,   0.01),   # 2
+    ("right_knee_pitch",    -0.8,   0.01),   # 3
+    ("right_ankle_pitch",   -0.4,   0.01),   # 4
+    ("right_ankle_roll",     0.0,   0.01),   # 5
+    ("left_hip_yaw",         0.0,   2.0),   # 6
+    ("left_hip_roll",        0.0,   2.0),   # 7
+    ("left_hip_pitch",      -0.4,   0.01),   # 8
+    ("left_knee_pitch",     -0.8,   0.01),   # 9
+    ("left_ankle_pitch",    -0.4,   0.01),   # 10
+    ("left_ankle_roll",      0.0,   0.01),   # 11
+    ("left_shoulder_pitch",  0.0,   1.0),   # 12
+    ("left_shoulder_roll",   0.2,   1.0),   # 13
+    ("left_elbow_roll",     -0.2,   1.0),   # 14
+    ("left_gripper_roll",    0.0,   1.0),   # 15
+    ("right_shoulder_pitch", 0.0,   1.0),   # 16
+    ("right_shoulder_roll", -0.2,   1.0),   # 17
+    ("right_elbow_roll",     0.2,   1.0),   # 18
+    ("right_gripper_roll",   0.0,   1.0),   # 19
 ]
 
 
@@ -566,13 +567,16 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
         scale: float = -1.0,
         scale_by_curriculum: bool = False,
     ) -> Self:
-        zeros = {k: v for k, v in ZEROS}
+        zeros = {k: v for k, v, _ in JOINT_BIASES}
+        weights = {k: w for k, _, w in JOINT_BIASES}
         joint_targets = [zeros[name] for name in names]
+        joint_weights = [weights[name] for name in names]
 
         return cls.create(
             physics_model=physics_model,
             joint_names=tuple(names),
             joint_targets=tuple(joint_targets),
+            joint_weights=tuple(joint_weights),
             scale=scale,
             scale_by_curriculum=scale_by_curriculum,
         )
@@ -608,7 +612,7 @@ class AnkleKneePenalty(JointPositionPenalty):
         scale_by_curriculum: bool = False,
     ) -> Self:
         return cls.create_from_names(
-            names=["left_knee_pitch", "left_ankle_pitch", "right_knee_pitch", "right_ankle_pitch"],
+            names=["left_knee_pitch", "left_ankle_pitch", "left_ankle_roll", "right_knee_pitch", "right_ankle_pitch", "right_ankle_roll"],
             physics_model=physics_model,
             scale=scale,
             scale_by_curriculum=scale_by_curriculum,
@@ -622,17 +626,15 @@ class ArmPosePenalty(JointPositionPenalty):
     def create_penalty(
         cls,
         physics_model: ksim.PhysicsModel,
-        scale: float = -0.05,          # tune to taste (-ve = penalty)
+        scale: float = -1.0,
         scale_by_curriculum: bool = True,
     ) -> "ArmPosePenalty":
         return cls.create_from_names(
             names=[
-                # left arm
                 "left_shoulder_pitch",
                 "left_shoulder_roll",
                 "left_elbow_roll",
                 "left_gripper_roll",
-                # right arm
                 "right_shoulder_pitch",
                 "right_shoulder_roll",
                 "right_elbow_roll",
@@ -928,7 +930,7 @@ class Actor(eqx.Module):
         # Softplus and clip to ensure positive standard deviations.
         std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
 
-        mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
+        mean_nm = mean_nm + jnp.array([v for _, v, _ in JOINT_BIASES])[:, None]
 
         dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
 
@@ -1426,7 +1428,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
-            ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.0),
+            ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v, _ in JOINT_BIASES}, scale=0.0),
             ksim.RandomJointVelocityReset(),
             # ksim.RandomHeadingReset(),
         ]
@@ -1487,7 +1489,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                     physics_model=physics_model,
                     joint_name=joint_name,
                 )
-                for joint_name, _ in ZEROS
+                for joint_name, _, _ in JOINT_BIASES
             ]
         )
 
@@ -1560,7 +1562,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 error_scale=0.25,
                 scale=0.3,
             ),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+            StraightLegPenalty.create_penalty(physics_model, scale=-0.25, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
             # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
@@ -1569,7 +1571,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             #     scale=-0.03,
             #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
             # ),
-            ArmPosePenalty.create_penalty(physics_model, scale=-15.00, scale_by_curriculum=True),
+            ArmPosePenalty.create_penalty(physics_model, scale=-2.00, scale_by_curriculum=True),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
