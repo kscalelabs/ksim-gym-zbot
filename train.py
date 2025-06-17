@@ -495,12 +495,17 @@ class BaseHeightReward(ksim.Reward):
 
 @attrs.define(frozen=True, kw_only=True)
 class FeetAirtimeReward(ksim.StatefulReward):
-    """Encourages reasonable step frequency by rewarding long swing phases and penalizing quick stepping."""
+    """
+    Encourages reasonable step frequency by rewarding long swing phases and
+    penalizing quick stepping. If `stand_still_threshold=None`, the reward is
+    *always* active (i.e. no zero-command masking).
+    """
 
     scale: float = 1.0
     ctrl_dt: float = 0.02
     touchdown_penalty: float = 0.4
     scale_by_curriculum: bool = False
+    stand_still_threshold: float | None = 1e-3
 
     def initial_carry(self, rng: PRNGKeyArray) -> PyTree:
         # initial left and right airtime
@@ -544,9 +549,10 @@ class FeetAirtimeReward(ksim.StatefulReward):
 
         reward = left_feet_airtime_reward + right_feet_airtime_reward
 
-        # standing mask
-        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
-        reward = jnp.where(is_zero_cmd, 0.0, reward)
+        # Optional zero-command masking
+        if self.stand_still_threshold is not None:
+            is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
+            reward = jnp.where(is_zero_cmd, 0.0, reward)
 
         return reward, reward_carry
 
@@ -1536,6 +1542,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 scale=2.5,
                 ctrl_dt=self.config.ctrl_dt,
                 touchdown_penalty=0.3,
+                stand_still_threshold=None,
             ),
             FeetOrientationReward.create(
                 physics_model,
