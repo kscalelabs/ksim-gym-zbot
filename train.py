@@ -400,11 +400,11 @@ class ConstantZeroCommand(ksim.Command):
     def get_name(self) -> str:
         return COMMAND_NAME
 
-    def initial_command(self, physics_data, *_) -> Array:
+    def initial_command(self, physics_data: ksim.PhysicsData, *_: object) -> Array:
         # Return all zeros: [vx=0, vy=0, wz=0, heading=0, bh=0, rx=0, ry=0]
         return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
-    def __call__(self, prev_command, physics_data, *_) -> Array:
+    def __call__(self, prev_command: Array, physics_data: ksim.PhysicsData, *_: object) -> Array:
         # Always return all zeros
         return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
@@ -466,9 +466,10 @@ class BaseHeightReward(ksim.Reward):
 
 @attrs.define(frozen=True, kw_only=True)
 class FeetAirtimeReward(ksim.StatefulReward):
-    """Encourages reasonable step frequency by rewarding long swing phases and
-    penalizing quick stepping. If `stand_still_threshold=None`, the reward is
-    *always* active (i.e. no zero-command masking).
+    """Encourages reasonable step frequency.
+
+    By rewarding long swing phases and penalizing quick stepping.
+    If `stand_still_threshold=None`, the reward is *always* active (i.e. no zero-command masking).
     """
 
     scale: float = 1.0
@@ -674,14 +675,19 @@ class SimpleSingleFootContactReward(ksim.Reward):
     """Reward having one and only one foot in contact with the ground, while walking."""
 
     scale: float = 1.0
+    stand_still_threshold: float | None = 1e-3
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
         right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
         single = jnp.logical_xor(left_contact, right_contact).squeeze()
 
-        is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < 1e-3
-        reward = jnp.where(is_zero_cmd, 1.0, single)
+        if self.stand_still_threshold is not None:
+            is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
+            reward = jnp.where(is_zero_cmd, 1.0, single)
+        else:
+            reward = single
+
         return reward
 
 
@@ -828,7 +834,7 @@ class ImuOrientationObservation(ksim.StatefulObservation):
 class BaseHeightObservation(ksim.Observation):
     """Single-scalar z of body-1 (the robot base)."""
 
-    def observe(self, state: ksim.ObservationInput, curriculum_level, rng):
+    def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
         # body 0 is world; body 1 is the floating base
         return state.physics_state.data.xpos[1, 2:]
 
@@ -1497,7 +1503,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             )
         ]
 
-    def get_rewards(self, physics_model):
+    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=1.0),
@@ -1509,7 +1515,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 norm="l1",
                 scale=-2.0,
             ),
-            # SimpleSingleFootContactReward(scale=0.3),
+            SimpleSingleFootContactReward(scale=0.3),
             FeetAirtimeReward(
                 scale=2.5,
                 ctrl_dt=self.config.ctrl_dt,
@@ -1541,7 +1547,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ksim.EpisodeLengthTermination(max_length_sec=80),
         ]
 
-    def get_curriculum(self, physics_model):
+    def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
         return ksim.EpisodeLengthCurriculum(
             num_levels=30,
             increase_threshold=30.0,
