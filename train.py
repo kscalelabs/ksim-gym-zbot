@@ -47,14 +47,14 @@ def get_servo_deadband() -> tuple[float, float]:
 # These are in the order of the neural network outputs.
 # (joint_name, reference_angle_rad, weight)
 JOINT_BIASES: list[tuple[str, float, float]] = [
-    ("right_hip_yaw",        0.0,   2.0),   # 0
-    ("right_hip_roll",       0.0,   2.0),   # 1
+    ("right_hip_yaw",        0.0,   1.0),   # 0
+    ("right_hip_roll",       0.0,   1.0),   # 1
     ("right_hip_pitch",     -0.4,   0.01),   # 2
     ("right_knee_pitch",    -0.8,   0.01),   # 3
     ("right_ankle_pitch",   -0.4,   0.01),   # 4
     ("right_ankle_roll",     0.0,   0.01),   # 5
-    ("left_hip_yaw",         0.0,   2.0),   # 6
-    ("left_hip_roll",        0.0,   2.0),   # 7
+    ("left_hip_yaw",         0.0,   1.0),   # 6
+    ("left_hip_roll",        0.0,   1.0),   # 7
     ("left_hip_pitch",      -0.4,   0.01),   # 8
     ("left_knee_pitch",     -0.8,   0.01),   # 9
     ("left_ankle_pitch",    -0.4,   0.01),   # 10
@@ -1562,7 +1562,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 error_scale=0.25,
                 scale=0.3,
             ),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.25, scale_by_curriculum=True),
+            StraightLegPenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
             # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
             # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
