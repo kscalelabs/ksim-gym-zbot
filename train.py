@@ -60,17 +60,17 @@ COMMAND_NAME = "zero_command"
 # (joint_name, reference_angle_rad, weight)
 JOINT_BIASES: list[tuple[str, float, float]] = [
     ("right_hip_yaw", 0.0, 1.0),  # 0
-    ("right_hip_roll", 0.0, 1.0),  # 1
+    ("right_hip_roll", -0.1, 1.0),  # 1
     ("right_hip_pitch", -0.4, 0.01),  # 2
     ("right_knee_pitch", -0.8, 0.01),  # 3
     ("right_ankle_pitch", -0.4, 0.01),  # 4
-    ("right_ankle_roll", 0.0, 0.01),  # 5
+    ("right_ankle_roll", -0.1, 0.01),  # 5
     ("left_hip_yaw", 0.0, 1.0),  # 6
-    ("left_hip_roll", 0.0, 1.0),  # 7
+    ("left_hip_roll", 0.1, 1.0),  # 7
     ("left_hip_pitch", -0.4, 0.01),  # 8
     ("left_knee_pitch", -0.8, 0.01),  # 9
     ("left_ankle_pitch", -0.4, 0.01),  # 10
-    ("left_ankle_roll", 0.0, 0.01),  # 11
+    ("left_ankle_roll", 0.1, 0.01),  # 11
     ("left_shoulder_pitch", 0.0, 1.0),  # 12
     ("left_shoulder_roll", 0.2, 1.0),  # 13
     ("left_elbow_roll", -0.2, 1.0),  # 14
