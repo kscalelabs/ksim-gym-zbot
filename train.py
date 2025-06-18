@@ -1783,5 +1783,6 @@ if __name__ == "__main__":
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
             render_azimuth=145.0,
+            # action_latency_range=(0.001, 0.02),
         ),
     )
