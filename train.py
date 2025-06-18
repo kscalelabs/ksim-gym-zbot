@@ -1552,7 +1552,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 norm="l1",
                 scale=-2.0,
             ),
-            # SimpleSingleFootContactReward(scale=0.3),
+            SimpleSingleFootContactReward(scale=0.3, stand_still_threshold=None),
             FeetAirtimeReward(
                 scale=2.5,
                 ctrl_dt=self.config.ctrl_dt,
