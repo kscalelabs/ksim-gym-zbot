@@ -696,9 +696,13 @@ class SimpleSingleFootContactReward(ksim.Reward):
     stand_still_threshold: float | None = 1e-3
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
-        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
-        single = jnp.logical_xor(left_contact, right_contact).squeeze()
+        left_touch = traj.obs["sensor_observation_left_foot_touch"]
+        right_touch = traj.obs["sensor_observation_right_foot_touch"]
+        
+        # keep the leading time dimension, drop only the trailing sensor dim
+        left_contact = (left_touch > 0.1)[..., 0]
+        right_contact = (right_touch > 0.1)[..., 0]
+        single = jnp.logical_xor(left_contact, right_contact)
 
         if self.stand_still_threshold is not None:
             is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
