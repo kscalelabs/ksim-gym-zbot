@@ -723,6 +723,28 @@ class ContactForcePenalty(ksim.Reward):
         return jnp.sum(cost, axis=-1)
 
 
+@attrs.define(frozen=True, kw_only=True)
+class FeetTooClosePenalty(ksim.Reward):
+    """Binary penalty when feet are closer than `threshold_m`.
+
+    `threshold_m` is set to 0.12 because the centers of zbot's feet are exactly 10cm apart.
+    """
+
+    feet_pos_obs_key: str = attrs.field(default="feet_position_observation")
+    threshold_m: float = attrs.field(default=0.12)
+    scale: float = attrs.field(default=-1.0)
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        feet = traj.obs[self.feet_pos_obs_key]
+        left = feet[..., :3]
+        right = feet[..., 3:]
+
+        # Get the euclidean distance between the feet.
+        dist = jnp.linalg.norm(left - right, axis=-1)
+
+        return (dist < self.threshold_m).astype(jnp.float32)
+
+
 def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
     """Rotates one quaternion by another quaternion through quaternion multiplication.
 
@@ -1545,6 +1567,11 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 target_rp=(0.0, 0.0),
                 error_scale=0.25,
                 scale=0.3,
+            ),
+            FeetTooClosePenalty(
+                feet_pos_obs_key="feet_position_observation",
+                threshold_m=0.12,
+                scale=-0.5,
             ),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
