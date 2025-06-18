@@ -698,8 +698,7 @@ class SimpleSingleFootContactReward(ksim.Reward):
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         left_touch = traj.obs["sensor_observation_left_foot_touch"]
         right_touch = traj.obs["sensor_observation_right_foot_touch"]
-        
-        # keep the leading time dimension, drop only the trailing sensor dim
+
         left_contact = (left_touch > 0.1)[..., 0]
         right_contact = (right_touch > 0.1)[..., 0]
         single = jnp.logical_xor(left_contact, right_contact)
