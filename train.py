@@ -37,14 +37,14 @@ ACTOR_DIM: dict[str, int] = dict(
 )
 
 CRITIC_DIM: dict[str, int] = dict(
-    jp=20,
-    jv=20,
-    com_inertia=250,  # 25 bodies × 10-elem inertia tensor each
-    com_velocity=150,  # 25 bodies × 6-DoF spatial vel each
+    joint_positions=20,
+    joint_velocity=20,
+    com_inertia=250,
+    com_velocity=150,
     imu_acc=3,
     imu_gyro=3,
     imu_quat=4,
-    cmd_all=7,  # full 7-d command vector
+    cmd_all=7,
     act_force=20,
     base_pos=3,
     base_quat=4,
@@ -317,7 +317,6 @@ class LinearVelocityTrackingReward(ksim.Reward):
 class L1LinearVelocityTrackingReward(ksim.Reward):
     """Reward that grows *linearly* as the XY speed approaches the command."""
 
-    # --- you can re-use the old fields, but error_scale now means "slope" --------
     slope: float = attrs.field(default=1.0)  # 1.0 → reward rises 1 unit per 1 m/s of error reduction
     linvel_obs_name: str = attrs.field(default="base_linear_velocity_observation")
     command_name: str = attrs.field(default=COMMAND_NAME)
@@ -328,33 +327,32 @@ class L1LinearVelocityTrackingReward(ksim.Reward):
         if self.linvel_obs_name not in trajectory.obs:
             raise ValueError(f"Observation {self.linvel_obs_name} not found; add it as an observation in your task.")
 
-        # -----------------------------------------------------------------------
-        # 1. Command in the ROBOT frame (unchanged)
         global_vel = trajectory.obs[self.linvel_obs_name]
+
+        # Get only yaw from base quat.
+        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        base_euler = base_euler.at[:, :2].set(0.0)  # keep only yaw
+        base_z_quat = xax.euler_to_quat(base_euler)
+
+        # Rotate global velocity into robot frame.
+        vel_robot = xax.rotate_vector_by_quat(global_vel, base_z_quat, inverse=True)
+        vel_robot_xy = vel_robot[:, :2]  # keep XY only
+
+        # Get robot frame command.
         robot_vel_cmd = (
             jnp.zeros_like(global_vel).at[:, :2].set(trajectory.command[self.command_name][:, :2])  # [vx_cmd, vy_cmd]
         )
 
-        # -----------------------------------------------------------------------
-        # 2. Rotate the *measured* velocity into the robot frame
-        base_euler = xax.quat_to_euler(trajectory.xquat[:, 1, :])
-        base_euler = base_euler.at[:, :2].set(0.0)  # keep only yaw
-        base_z_quat = xax.euler_to_quat(base_euler)
-        vel_robot = xax.rotate_vector_by_quat(global_vel, base_z_quat, inverse=True)
-        vel_robot_xy = vel_robot[:, :2]  # keep XY only
-
-        # -----------------------------------------------------------------------
-        # 3. L1 error in robot coordinates
+        # Compute L1 error in robot coordinates.
         diff_xy = vel_robot_xy - robot_vel_cmd[:, :2]
         error = jnp.sum(xax.get_norm(diff_xy, "l1"), axis=-1)
 
-        # A.  Standing still kernel (optional – same trick you had)
+        # Standing still kernel.
         zero_cmd_mask = (
             jnp.linalg.norm(trajectory.command[self.command_name][:, :3], axis=-1) < self.stand_still_threshold
         )
 
-        # Reward is target_bonus - slope*error for walking, target_bonus - slope*vel for stand-still
-        # (negative sign because RL maximises reward)
+        # Reward is target_bonus - slope*error for walking, target_bonus - slope*vel for stand-still.
         walk_reward = self.target_bonus - self.slope * error
         stand_reward = self.target_bonus - self.slope * jnp.sum(xax.get_norm(vel_robot_xy, "l1"), axis=-1)
 
@@ -423,11 +421,9 @@ class ConstantZeroCommand(ksim.Command):
         return COMMAND_NAME
 
     def initial_command(self, physics_data: ksim.PhysicsData, *_: object) -> Array:
-        # Return all zeros: [vx=0, vy=0, wz=0, heading=0, bh=0, rx=0, ry=0]
         return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     def __call__(self, prev_command: Array, physics_data: ksim.PhysicsData, *_: object) -> Array:
-        # Always return all zeros
         return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
@@ -1537,7 +1533,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 norm="l1",
                 scale=-2.0,
             ),
-            SimpleSingleFootContactReward(scale=0.3),
+            # SimpleSingleFootContactReward(scale=0.3),
             FeetAirtimeReward(
                 scale=2.5,
                 ctrl_dt=self.config.ctrl_dt,
@@ -1642,8 +1638,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             [
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
-                com_inertia_n,  # 160
-                com_vel_n,  # 96
+                com_inertia_n,  # 250
+                com_vel_n,  # 150
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
                 imu_quat_4,  # 4
