@@ -26,10 +26,32 @@ logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 20
 NUM_COMMANDS = 6
-NUM_ACTOR_INPUTS = 20 + 20 + 4 + NUM_COMMANDS  # 50
-# Critic inputs: joint_pos + joint_vel + com_inertia + com_vel + imu_acc
-# + imu_gyro + imu_quat + full_cmd + act_force + base_pos + base_quat
-NUM_CRITIC_INPUTS = 484  # 340
+
+ACTOR_DIM: dict[str, int] = dict(
+    joint_positions=20,
+    joint_velocity=20,
+    imu_orientation=4,
+    cmd_linear_velocity=2,
+    cmd_absolute_yaw=1,
+    cmd_base_height_roll_pitch=3,
+)
+
+CRITIC_DIM: dict[str, int] = dict(
+    jp=20,
+    jv=20,
+    com_inertia=250,  # 25 bodies × 10-elem inertia tensor each
+    com_velocity=150,  # 25 bodies × 6-DoF spatial vel each
+    imu_acc=3,
+    imu_gyro=3,
+    imu_quat=4,
+    cmd_all=7,  # full 7-d command vector
+    act_force=20,
+    base_pos=3,
+    base_quat=4,
+)
+
+NUM_ACTOR_INPUTS = sum(ACTOR_DIM.values())  # 50
+NUM_CRITIC_INPUTS = sum(CRITIC_DIM.values())  # 484
 
 COMMAND_NAME = "zero_command"
 
