@@ -570,6 +570,23 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+class AllJointsReturnPenalty(JointPositionPenalty):
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        scale: float = -1.0,
+        scale_by_curriculum: bool = False,
+    ) -> Self:
+        # Use all joint names from JOINT_BIASES
+        all_joint_names = [name for name, _, _ in JOINT_BIASES]
+        
+        return cls.create_from_names(
+            names=all_joint_names,
+            physics_model=physics_model,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
 
 @attrs.define(frozen=True, kw_only=True)
 class StraightLegPenalty(JointPositionPenalty):
@@ -1339,8 +1356,8 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         physics_model: ksim.PhysicsModel,
         metadata: Metadata | None = None,
     ) -> FeetechActuators:
-        vmax_default = 5.0  # rad · s⁻¹ fallback
-        amax_default = 17.45
+        vmax_default = 2.0  # rad/s
+        amax_default = 17.45 # rad/s^2
 
         if metadata is None:
             raise ValueError("metadata must be provided")
@@ -1454,14 +1471,14 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
             ksim.PushEvent(
-                x_linvel=0.1,
-                y_linvel=0.1,
-                z_linvel=0.05,
-                x_angvel=0.0,
-                y_angvel=0.0,
-                z_angvel=0.0,
-                vel_range=(0.05, 0.15),
-                interval_range=(2.0, 4.0),
+                x_linvel=0.8,       
+                y_linvel=0.8,      
+                z_linvel=0.1,
+                x_angvel=0.2,
+                y_angvel=0.2,
+                z_angvel=0.3, 
+                vel_range=(0.3, 0.8), 
+                interval_range=(3.0, 8.0),
             ),
         ]
 
@@ -1542,23 +1559,25 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
-            ksim.StayAliveReward(scale=1.0),
-            ksim.UprightReward(scale=1.0),
-            ksim.NaiveForwardReward(scale=5.0, clip_min=None, clip_max=0.2),
-            ksim.NaiveForwardOrientationReward(scale=0.3),
+            ksim.StayAliveReward(scale=2.0),
+            ksim.UprightReward(scale=3.0),
+
+           
+            #ksim.NaiveForwardReward(scale=5.0, clip_min=None, clip_max=0.2),
+            #ksim.NaiveForwardOrientationReward(scale=0.3),
             ksim.LinearVelocityPenalty(
-                index="y",
+                index=("x", "y"), 
                 in_robot_frame=True,
-                norm="l1",
-                scale=-2.0,
+                norm="l2",
+                scale=-0.5,
             ),
-            SimpleSingleFootContactReward(scale=0.3, stand_still_threshold=None),
-            FeetAirtimeReward(
-                scale=2.5,
-                ctrl_dt=self.config.ctrl_dt,
-                touchdown_penalty=0.3,
-                stand_still_threshold=None,
-            ),
+            SimpleSingleFootContactReward(scale=0.5, stand_still_threshold=None),
+            #FeetAirtimeReward(
+            #    scale=3.0,
+            #    ctrl_dt=self.config.ctrl_dt,
+            #    touchdown_penalty=0.3,
+            #    stand_still_threshold=None,
+            #),
             FeetOrientationReward.create(
                 physics_model,
                 target_rp=(0.0, 0.0),
@@ -1570,30 +1589,50 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 threshold_m=0.12,
                 scale=-0.5,
             ),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True),
-            AnkleKneePenalty.create_penalty(physics_model, scale=-0.05, scale_by_curriculum=True),
+
+            AllJointsReturnPenalty.create_penalty(
+                physics_model=physics_model, 
+                scale=-1.0,
+                scale_by_curriculum=True,
+            ),
+            #StraightLegPenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True),
+            #AnkleKneePenalty.create_penalty(physics_model, scale=-0.025, scale_by_curriculum=True),
+            
             # ksim.ActionVelocityPenalty(scale=-0.01,  scale_by_curriculum=True),
             # ksim.JointVelocityPenalty (scale=-0.01,  scale_by_curriculum=True),
             # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
-            #     scale=-0.03,
-            #     sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
-            # ),
+            ContactForcePenalty( # NOTE this could actually be good but eliminate until needed
+                 scale=-0.03,
+                 sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
+            ),
             ArmPosePenalty.create_penalty(physics_model, scale=-2.00, scale_by_curriculum=True),
+            #ksim.ActionTrackingReward(
+            #    error_scale=0.1,
+            #    scale=0.4,
+            #    use_exponential=False,
+            #    scale_by_curriculum=True,
+            #),
+            #ksim.ActionVelocityPenalty(scale=-2.0, scale_by_curriculum=True),
+            ksim.ReachabilityPenalty(
+                delta_max_j=tuple(float(x) for x in self.delta_max_j),
+                scale=-1.0,
+                squared=False,
+                scale_by_curriculum=True,
+            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
         return [
             ksim.BadZTermination(unhealthy_z_lower=0.05, unhealthy_z_upper=0.5),
-            ksim.NotUprightTermination(max_radians=math.radians(60)),
+            ksim.NotUprightTermination(max_radians=math.radians(75)),
             ksim.EpisodeLengthTermination(max_length_sec=80),
         ]
 
     def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
         return ksim.EpisodeLengthCurriculum(
             num_levels=30,
-            increase_threshold=30.0,
-            decrease_threshold=10.0,
+            increase_threshold=4.0,
+            decrease_threshold=2.0,
             min_level_steps=10,
             min_level=0.5,
         )
@@ -1603,7 +1642,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             key,
             num_inputs=NUM_ACTOR_INPUTS,
             num_outputs=NUM_JOINTS,
-            min_std=0.01,
+            min_std=0.03,
             max_std=1.0,
             hidden_size=self.config.hidden_size,
             num_mixtures=self.config.num_mixtures,
@@ -1625,11 +1664,11 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
         obs_n = jnp.concatenate(
             [
-                joint_pos_n,  # NUM_JOINTS
-                joint_vel_n,  # NUM_JOINTS
-                imu_quat_4,  # 4
+                joint_pos_n,   # NUM_JOINTS
+                joint_vel_n,   # NUM_JOINTS
+                imu_quat_4,    # 4
                 cmd[..., :2],  # vx, vy
-                cmd[..., 3:4],  # heading   (index 3)
+                cmd[..., 3:4], # heading   (index 3)
                 cmd[..., 4:],  # bh, rx, ry
             ],
             axis=-1,
@@ -1780,6 +1819,6 @@ if __name__ == "__main__":
             valid_every_n_steps=5,
             render_full_every_n_seconds=10,
             render_azimuth=145.0,
-            # action_latency_range=(0.001, 0.02),
+            action_latency_range=(0.003, 0.10),
         ),
     )
